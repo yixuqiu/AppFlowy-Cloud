@@ -29,7 +29,9 @@ services:
 
   postgres:
     restart: on-failure
-    image: postgres
+    build:
+      context: ./postgres
+      dockerfile: postgres.Dockerfile
     ports:
       - "5432:5432"
     environment:
@@ -39,7 +41,6 @@ services:
       - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
     volumes:
       - ./migrations/before:/docker-entrypoint-initdb.d
-  #      - postgres_data:/var/lib/postgresql/data
 
   redis:
     restart: on-failure
@@ -112,6 +113,8 @@ services:
       - APPFLOWY_S3_BUCKET=${APPFLOWY_S3_BUCKET}
       - APPFLOWY_S3_REGION=${APPFLOWY_S3_REGION}
       - APPFLOWY_ACCESS_CONTROL=${APPFLOWY_ACCESS_CONTROL}
+      # For the CI testing, we set the database connection to 20. The default value is 40.
+      - APPFLOWY_DATABASE_MAX_CONNECTIONS=20
       - APPFLOWY_AI_SERVER_HOST=${APPFLOWY_AI_SERVER_HOST}
       - APPFLOWY_AI_SERVER_PORT=${APPFLOWY_AI_SERVER_PORT}
     build:
@@ -133,15 +136,15 @@ services:
       - ADMIN_FRONTEND_GOTRUE_URL=${ADMIN_FRONTEND_GOTRUE_URL:-http://gotrue:9999}
       - ADMIN_FRONTEND_APPFLOWY_CLOUD_URL=${ADMIN_FRONTEND_APPFLOWY_CLOUD_URL:-http://appflowy_cloud:8000}
 
-  appflowy_ai:
+  ai:
     restart: on-failure
     image: appflowyinc/appflowy_ai:${APPFLOWY_AI_VERSION:-latest}
     ports:
       - "5001:5001"
     environment:
       - OPENAI_API_KEY=${APPFLOWY_AI_OPENAI_API_KEY}
-      - APPFLOWY_AI_SERVER_HOST=${APPFLOWY_AI_SERVER_HOST}
       - APPFLOWY_AI_SERVER_PORT=${APPFLOWY_AI_SERVER_PORT}
+      - APPFLOWY_AI_DATABASE_URL=${APPFLOWY_AI_DATABASE_URL}
 
   appflowy_history:
     restart: on-failure

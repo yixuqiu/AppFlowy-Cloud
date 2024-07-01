@@ -1,18 +1,20 @@
-use crate::error::RealtimeError;
-use crate::group::manager::GroupManager;
-use crate::RealtimeAccessControl;
+use std::sync::Arc;
+
 use async_stream::stream;
+use collab::entity::EncodedCollab;
+use dashmap::DashMap;
+use futures_util::StreamExt;
+use tracing::{instrument, trace, warn};
+
+use access_control::collab::RealtimeAccessControl;
 use collab_rt_entity::user::RealtimeUser;
 use collab_rt_entity::{ClientCollabMessage, ServerCollabMessage, SinkMessage};
 use collab_rt_entity::{CollabAck, RealtimeMessage};
-use dashmap::DashMap;
 use database::collab::CollabStorage;
 
 use crate::client::client_msg_router::ClientMessageRouter;
-use collab::entity::EncodedCollab;
-use futures_util::StreamExt;
-use std::sync::Arc;
-use tracing::{error, instrument, trace, warn};
+use crate::error::RealtimeError;
+use crate::group::manager::GroupManager;
 
 /// Using [GroupCommand] to interact with the group
 /// - HandleClientCollabMessage: Handle the client message
@@ -22,6 +24,7 @@ pub enum GroupCommand {
     user: RealtimeUser,
     object_id: String,
     collab_messages: Vec<ClientCollabMessage>,
+    ret: tokio::sync::oneshot::Sender<Result<(), RealtimeError>>,
   },
   EncodeCollab {
     object_id: String,
@@ -43,7 +46,6 @@ where
 {
   pub group_manager: Arc<GroupManager<S, AC>>,
   pub msg_router_by_user: Arc<DashMap<RealtimeUser, ClientMessageRouter>>,
-  pub access_control: Arc<AC>,
   pub recv: Option<GroupCommandReceiver>,
 }
 
@@ -68,12 +70,13 @@ where
             user,
             object_id,
             collab_messages,
+            ret,
           } => {
-            if let Err(err) = self
+            let result = self
               .handle_client_collab_message(&user, object_id, collab_messages)
-              .await
-            {
-              error!("handle client message error: {}", err);
+              .await;
+            if let Err(err) = ret.send(result) {
+              warn!("Send handle client collab message result fail: {:?}", err);
             }
           },
           GroupCommand::EncodeCollab { object_id, ret } => {
@@ -140,7 +143,7 @@ where
       // If there is no existing group for the given object_id and the message is an 'init message',
       // then create a new group and add the user as a subscriber to this group.
       if first_message.is_client_init_sync() {
-        self.create_group(first_message).await?;
+        self.create_group(user, first_message).await?;
         self.subscribe_group(user, first_message).await?;
         forward_message_to_group(user, object_id, messages, &self.msg_router_by_user).await;
       } else if let Some(entry) = self.msg_router_by_user.get(user) {
@@ -189,20 +192,22 @@ where
   }
 
   #[instrument(level = "info", skip_all)]
-  async fn create_group(&self, collab_message: &ClientCollabMessage) -> Result<(), RealtimeError> {
+  async fn create_group(
+    &self,
+    user: &RealtimeUser,
+    collab_message: &ClientCollabMessage,
+  ) -> Result<(), RealtimeError> {
     let object_id = collab_message.object_id();
     match collab_message {
       ClientCollabMessage::ClientInitSync { data, .. } => {
-        let uid = data
-          .origin
-          .client_user_id()
-          .ok_or(RealtimeError::ExpectInitSync(
-            "The client user id is empty".to_string(),
-          ))?;
-
         self
           .group_manager
-          .create_group(uid, &data.workspace_id, object_id, data.collab_type.clone())
+          .create_group(
+            user,
+            &data.workspace_id,
+            object_id,
+            data.collab_type.clone(),
+          )
           .await?;
 
         Ok(())

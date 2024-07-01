@@ -1,4 +1,6 @@
 use collab::error::CollabError;
+use collab_stream::error::StreamError;
+use std::fmt::Display;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RealtimeError {
@@ -41,6 +43,9 @@ pub enum RealtimeError {
   #[error("group is not exist: {0}")]
   GroupNotFound(String),
 
+  #[error("Create group failed:{0}")]
+  CreateGroupFailed(CreateGroupFailedReason),
+
   #[error("Lack of required collab data: {0}")]
   NoRequiredCollabData(String),
 
@@ -50,11 +55,42 @@ pub enum RealtimeError {
   #[error("Acquire lock timeout")]
   LockTimeout,
 
-  #[error("Collab workspace id not match: expect {expect}, actual {actual}")]
-  CollabWorkspaceIdNotMatch { expect: String, actual: String },
-
   #[error("Internal failure: {0}")]
   Internal(#[from] anyhow::Error),
+
+  #[error("Collab redis stream error: {0}")]
+  StreamError(#[from] StreamError),
+}
+
+#[derive(Debug)]
+pub enum CreateGroupFailedReason {
+  CollabWorkspaceIdNotMatch {
+    expect: String,
+    actual: String,
+    detail: String,
+  },
+  CannotGetCollabData,
+}
+
+impl Display for CreateGroupFailedReason {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      CreateGroupFailedReason::CollabWorkspaceIdNotMatch {
+        expect,
+        actual,
+        detail,
+      } => {
+        write!(
+          f,
+          "Collab workspace id not match: expect {}, actual {}, detail: {}",
+          expect, actual, detail
+        )
+      },
+      CreateGroupFailedReason::CannotGetCollabData => {
+        write!(f, "Cannot get collab data")
+      },
+    }
+  }
 }
 
 impl RealtimeError {
@@ -64,5 +100,8 @@ impl RealtimeError {
 
   pub fn is_lock_timeout(&self) -> bool {
     matches!(self, RealtimeError::LockTimeout)
+  }
+  pub fn is_create_group_failed(&self) -> bool {
+    matches!(self, RealtimeError::CreateGroupFailed(_))
   }
 }

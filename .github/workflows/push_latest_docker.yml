@@ -237,6 +237,7 @@ jobs:
       - name: Logout from Docker Hub
         if: always()
         run: docker logout
+
   appflowy_history_image:
     runs-on: ubuntu-22.04
     env:

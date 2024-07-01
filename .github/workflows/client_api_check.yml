@@ -29,11 +29,7 @@ jobs:
         working-directory: ./libs/client-api
         run: cargo build --features "enable_brotli"
 
-      - name: Build ClientAPI WASM
-        working-directory: ./libs/client-api
-        run: wasm-pack build
-
       - name: Check ClientAPI Dependencies
         working-directory: ./libs/client-api
-        run: bash ../../build/client_api_deps_check.sh
+        run: bash ../../script/client_api_deps_check.sh
 

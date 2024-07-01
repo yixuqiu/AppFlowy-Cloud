@@ -1,29 +1,31 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+use anyhow::Result;
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
+use tokio::sync::Notify;
+use tokio::time::interval;
+use tracing::{error, info, trace};
+
+use access_control::collab::RealtimeAccessControl;
+use collab_rt_entity::user::{RealtimeUser, UserDevice};
+use collab_rt_entity::MessageByObjectId;
+use collab_stream::client::CollabRedisStream;
+use database::collab::CollabStorage;
+
 use crate::client::client_msg_router::ClientMessageRouter;
 use crate::command::{spawn_collaboration_command, CLCommandReceiver};
 use crate::connect_state::ConnectState;
 use crate::error::RealtimeError;
 use crate::group::cmd::{GroupCommand, GroupCommandRunner, GroupCommandSender};
 use crate::group::manager::GroupManager;
+use crate::indexer::IndexerProvider;
 use crate::metrics::CollabMetricsCalculate;
-use crate::{
-  spawn_metrics, CollabRealtimeMetrics, RealtimeAccessControl, RealtimeClientWebsocketSink,
-};
-use anyhow::Result;
-use collab_rt_entity::user::{RealtimeUser, UserDevice};
-use collab_rt_entity::MessageByObjectId;
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
-use database::collab::CollabStorage;
-
-use std::future::Future;
-
-use std::pin::Pin;
-use std::sync::{Arc, Weak};
-use std::time::Duration;
-
-use tokio::sync::Notify;
-use tokio::time::interval;
-use tracing::{error, info, trace};
+use crate::state::RedisConnectionManager;
+use crate::{spawn_metrics, CollabRealtimeMetrics, RealtimeClientWebsocketSink};
 
 #[derive(Clone)]
 pub struct CollaborationServer<S, AC> {
@@ -31,7 +33,7 @@ pub struct CollaborationServer<S, AC> {
   group_manager: Arc<GroupManager<S, AC>>,
   connect_state: ConnectState,
   group_sender_by_object_id: Arc<DashMap<String, GroupCommandSender>>,
-  access_control: Arc<AC>,
+  storage: Arc<S>,
   #[allow(dead_code)]
   metrics: Arc<CollabRealtimeMetrics>,
   metrics_calculate: CollabMetricsCalculate,
@@ -42,11 +44,17 @@ where
   S: CollabStorage,
   AC: RealtimeAccessControl,
 {
-  pub fn new(
+  #[allow(clippy::too_many_arguments)]
+  pub async fn new(
     storage: Arc<S>,
     access_control: AC,
     metrics: Arc<CollabRealtimeMetrics>,
     command_recv: CLCommandReceiver,
+    redis_connection_manager: RedisConnectionManager,
+    group_persistence_interval: Duration,
+    edit_state_max_count: u32,
+    edit_state_max_secs: i64,
+    indexer_provider: Arc<IndexerProvider>,
   ) -> Result<Self, RealtimeError> {
     if cfg!(feature = "collab-rt-multi-thread") {
       info!("CollaborationServer with multi-thread feature enabled");
@@ -55,11 +63,20 @@ where
     let metrics_calculate = CollabMetricsCalculate::default();
     let connect_state = ConnectState::new();
     let access_control = Arc::new(access_control);
-    let group_manager = Arc::new(GroupManager::new(
-      storage.clone(),
-      access_control.clone(),
-      metrics_calculate.clone(),
-    ));
+    let collab_stream = CollabRedisStream::new_with_connection_manager(redis_connection_manager);
+    let group_manager = Arc::new(
+      GroupManager::new(
+        storage.clone(),
+        access_control.clone(),
+        metrics_calculate.clone(),
+        collab_stream,
+        group_persistence_interval,
+        edit_state_max_count,
+        edit_state_max_secs,
+        indexer_provider.clone(),
+      )
+      .await?,
+    );
     let group_sender_by_object_id: Arc<DashMap<String, GroupCommandSender>> =
       Arc::new(Default::default());
 
@@ -68,11 +85,14 @@ where
     spawn_collaboration_command(command_recv, &group_sender_by_object_id);
 
     spawn_metrics(&metrics, &metrics_calculate, &storage);
+
+    spawn_handle_unindexed_collabs(indexer_provider);
+
     Ok(Self {
+      storage,
       group_manager,
       connect_state,
       group_sender_by_object_id,
-      access_control,
       metrics,
       metrics_calculate,
     })
@@ -94,13 +114,17 @@ where
     let group_manager = self.group_manager.clone();
     let connect_state = self.connect_state.clone();
     let metrics_calculate = self.metrics_calculate.clone();
+    let storage = self.storage.clone();
 
     Box::pin(async move {
+      storage
+        .add_connected_user(connected_user.uid, &connected_user.device_id)
+        .await;
+
       if let Some(old_user) = connect_state.handle_user_connect(connected_user, new_client_router) {
         // Remove the old user from all collaboration groups.
         group_manager.remove_user(&old_user).await;
       }
-
       metrics_calculate.connected_users.store(
         connect_state.number_of_connected_users() as i64,
         std::sync::atomic::Ordering::Relaxed,
@@ -123,11 +147,16 @@ where
     let group_manager = self.group_manager.clone();
     let connect_state = self.connect_state.clone();
     let metrics_calculate = self.metrics_calculate.clone();
+    let storage = self.storage.clone();
 
     Box::pin(async move {
       trace!("[realtime]: disconnect => {}", disconnect_user);
       let was_removed = connect_state.handle_user_disconnect(&disconnect_user);
       if was_removed.is_some() {
+        storage
+          .remove_connected_user(disconnect_user.uid, &disconnect_user.device_id)
+          .await;
+
         metrics_calculate.connected_users.store(
           connect_state.number_of_connected_users() as i64,
           std::sync::atomic::Ordering::Relaxed,
@@ -149,7 +178,6 @@ where
     let group_sender_by_object_id = self.group_sender_by_object_id.clone();
     let client_msg_router_by_user = self.connect_state.client_message_routers.clone();
     let group_manager = self.group_manager.clone();
-    let access_control = self.access_control.clone();
 
     Box::pin(async move {
       for (object_id, collab_messages) in message_by_oid {
@@ -167,7 +195,6 @@ where
               let runner = GroupCommandRunner {
                 group_manager: group_manager.clone(),
                 msg_router_by_user: client_msg_router_by_user.clone(),
-                access_control: access_control.clone(),
                 recv: Some(recv),
               };
 
@@ -183,18 +210,34 @@ where
           },
         };
 
-        if let Err(err) = sender
-          .send(GroupCommand::HandleClientCollabMessage {
-            user: user.clone(),
-            object_id,
-            collab_messages,
-          })
-          .await
-        {
-          // it should not happen. Because the receiver is always running before acquiring the sender.
-          // Otherwise, the GroupCommandRunner might not be ready to handle the message.
-          error!("Send message to group fail: {}", err);
-        }
+        let cloned_user = user.clone();
+        // Create a new task to send a message to the group command runner without waiting for the
+        // result. This approach is used to prevent potential issues with the actor's mailbox in
+        // single-threaded runtimes (like actix-web actors). By spawning a task, the actor can
+        // immediately proceed to process the next message.
+        tokio::spawn(async move {
+          let (tx, rx) = tokio::sync::oneshot::channel();
+          match sender
+            .send(GroupCommand::HandleClientCollabMessage {
+              user: cloned_user,
+              object_id,
+              collab_messages,
+              ret: tx,
+            })
+            .await
+          {
+            Ok(_) => {
+              if let Ok(Err(err)) = rx.await {
+                error!("Handle client collab message fail: {}", err);
+              }
+            },
+            Err(err) => {
+              // it should not happen. Because the receiver is always running before acquiring the sender.
+              // Otherwise, the GroupCommandRunner might not be ready to handle the message.
+              error!("Send message to group fail: {}", err);
+            },
+          }
+        });
       }
 
       Ok(())
@@ -208,6 +251,10 @@ where
       .get(user_device)
       .map(|entry| entry.value().clone())
   }
+}
+
+fn spawn_handle_unindexed_collabs(indexer_provider: Arc<IndexerProvider>) {
+  tokio::task::spawn_local(IndexerProvider::handle_unindexed_collabs(indexer_provider));
 }
 
 fn spawn_period_check_inactive_group<S, AC>(
@@ -242,11 +289,13 @@ fn spawn_period_check_inactive_group<S, AC>(
 /// When appflowy-collaborate is deployed as a standalone service, we can use tokio multi-thread.
 #[cfg(feature = "collab-rt-multi-thread")]
 mod collaboration_runtime {
-  use lazy_static::lazy_static;
   use std::future::Future;
   use std::io;
+
+  use lazy_static::lazy_static;
   use tokio::runtime;
   use tokio::runtime::Runtime;
+
   lazy_static! {
     pub(crate) static ref COLLAB_RUNTIME: Runtime = default_tokio_runtime().unwrap();
   }

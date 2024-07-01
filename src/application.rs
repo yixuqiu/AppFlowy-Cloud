@@ -7,17 +7,10 @@ use crate::api::ws::ws_scope;
 use crate::mailer::Mailer;
 use access_control::access::{enable_access_control, AccessControl};
 
-use crate::biz::actix_ws::server::RealtimeServerActor;
-use crate::biz::casbin::{
-  CollabAccessControlImpl, RealtimeCollabAccessControlImpl, WorkspaceAccessControlImpl,
-};
-use crate::biz::collab::access_control::{
-  CollabMiddlewareAccessControl, CollabStorageAccessControlImpl,
-};
-use crate::biz::collab::cache::CollabCache;
-use crate::biz::collab::storage::CollabStorageImpl;
+use crate::api::chat::chat_scope;
+use crate::api::history::history_scope;
+use crate::biz::collab::access_control::CollabMiddlewareAccessControl;
 use crate::biz::pg_listener::PgListeners;
-use crate::biz::snapshot::SnapshotControl;
 use crate::biz::workspace::access_control::WorkspaceMiddlewareAccessControl;
 use crate::config::config::{Config, DatabaseSetting, GoTrueSetting, S3Setting};
 use crate::middleware::access_control_mw::MiddlewareAccessControlTransform;
@@ -26,26 +19,49 @@ use crate::middleware::request_id::RequestIdMiddleware;
 use crate::self_signed::create_self_signed_certificate;
 use crate::state::{AppMetrics, AppState, GoTrueAdmin, UserCache};
 use actix::Supervisor;
+
 use actix_identity::IdentityMiddleware;
 use actix_session::storage::RedisSessionStore;
 use actix_session::SessionMiddleware;
 use actix_web::cookie::Key;
-use actix_web::{dev::Server, web, web::Data, App, HttpServer};
+use actix_web::middleware::NormalizePath;
+use actix_web::{dev::Server, web::Data, App, HttpServer};
 use anyhow::{Context, Error};
 use appflowy_ai_client::client::AppFlowyAIClient;
+use appflowy_collaborate::actix_ws::server::RealtimeServerActor;
+use appflowy_collaborate::collab::access_control::{
+  CollabAccessControlImpl, CollabStorageAccessControlImpl, RealtimeCollabAccessControlImpl,
+};
+use appflowy_collaborate::collab::cache::CollabCache;
+use appflowy_collaborate::collab::storage::CollabStorageImpl;
 use appflowy_collaborate::command::{CLCommandReceiver, CLCommandSender};
+use appflowy_collaborate::shared_state::RealtimeSharedState;
+use appflowy_collaborate::snapshot::SnapshotControl;
 use appflowy_collaborate::CollaborationServer;
-use database::file::bucket_s3_impl::S3BucketStorage;
+
+use aws_sdk_s3::config::{Credentials, Region, SharedCredentialsProvider};
+use aws_sdk_s3::operation::create_bucket::CreateBucketError;
+use aws_sdk_s3::types::{
+  BucketInfo, BucketLocationConstraint, BucketType, CreateBucketConfiguration,
+};
 use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use secrecy::{ExposeSecret, Secret};
 use snowflake::Snowflake;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::net::TcpListener;
+
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tokio::sync::{Mutex, RwLock};
+use tonic_proto::history::history_client::HistoryClient;
+
+use crate::api::ai::ai_completion_scope;
+use crate::api::search::search_scope;
+use appflowy_collaborate::indexer::IndexerProvider;
+use database::file::s3_client_impl::{AwsS3BucketClientImpl, S3BucketStorage};
+use tracing::{error, info, warn};
+use workspace_access::WorkspaceAccessControlImpl;
 
 pub struct Application {
   port: u16,
@@ -61,6 +77,7 @@ impl Application {
     let address = format!("{}:{}", config.application.host, config.application.port);
     let listener = TcpListener::bind(&address)?;
     let port = listener.local_addr().unwrap().port();
+    info!("Server started at {}", listener.local_addr().unwrap());
     let actix_server = run_actix_server(listener, state, config, rt_cmd_recv).await?;
 
     Ok(Self { port, actix_server })
@@ -80,7 +97,7 @@ pub async fn run_actix_server(
   state: AppState,
   config: Config,
   rt_cmd_recv: CLCommandReceiver,
-) -> Result<Server, anyhow::Error> {
+) -> Result<Server, Error> {
   let redis_store = RedisSessionStore::new(config.redis_uri.expose_secret())
     .await
     .map_err(|e| {
@@ -113,12 +130,19 @@ pub async fn run_actix_server(
     RealtimeCollabAccessControlImpl::new(state.access_control.clone()),
     state.metrics.realtime_metrics.clone(),
     rt_cmd_recv,
+    state.redis_connection_manager.clone(),
+    Duration::from_secs(config.collab.group_persistence_interval_secs),
+    config.collab.edit_state_max_count,
+    config.collab.edit_state_max_secs,
+    state.indexer_provider.clone(),
   )
+  .await
   .unwrap();
 
   let realtime_server_actor = Supervisor::start(|_| RealtimeServerActor(realtime_server));
   let mut server = HttpServer::new(move || {
     App::new()
+      .wrap(NormalizePath::trim())
        // Middleware is registered for each App, scope, or Resource and executed in opposite order as registration
       .wrap(MetricsMiddleware)
       .wrap(IdentityMiddleware::default())
@@ -129,18 +153,22 @@ pub async fn run_actix_server(
       // .wrap(DecryptPayloadMiddleware)
       .wrap(access_control.clone())
       .wrap(RequestIdMiddleware)
-      .app_data(web::JsonConfig::default().limit(5 * 1024 * 1024))
       .service(user_scope())
       .service(workspace_scope())
       .service(collab_scope())
       .service(ws_scope())
       .service(file_storage_scope())
+      .service(chat_scope())
+      .service(ai_completion_scope())
+      .service(history_scope())
       .service(metrics_scope())
+      .service(search_scope())
       .app_data(Data::new(state.metrics.registry.clone()))
       .app_data(Data::new(state.metrics.request_metrics.clone()))
       .app_data(Data::new(state.metrics.realtime_metrics.clone()))
       .app_data(Data::new(state.metrics.access_control_metrics.clone()))
       .app_data(Data::new(realtime_server_actor.clone()))
+      .app_data(Data::new(state.config.gotrue.jwt_secret.clone()))
       .app_data(Data::new(state.clone()))
       .app_data(Data::new(storage.clone()))
   });
@@ -175,8 +203,14 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
 
   // Bucket storage
   info!("Setting up S3 bucket...");
-  let s3_bucket = get_aws_s3_bucket(&config.s3).await?;
-  let bucket_storage = Arc::new(S3BucketStorage::from_s3_bucket(s3_bucket, pg_pool.clone()));
+  let s3_client = AwsS3BucketClientImpl::new(
+    get_aws_s3_client(&config.s3).await?,
+    config.s3.bucket.clone(),
+  );
+  let bucket_storage = Arc::new(S3BucketStorage::from_bucket_impl(
+    s3_client,
+    pg_pool.clone(),
+  ));
 
   // Gotrue
   info!("Connecting to GoTrue...");
@@ -187,8 +221,9 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
   info!("Connecting to Redis...");
   let redis_conn_manager = get_redis_client(config.redis_uri.expose_secret()).await?;
 
-  info!("Connecting to AppFlowy AI: {}", config.appflowy_ai.url());
+  info!("Setup AppFlowy AI: {}", config.appflowy_ai.url());
   let appflowy_ai_client = AppFlowyAIClient::new(&config.appflowy_ai.url());
+  let indexer_provider = IndexerProvider::new(pg_pool.clone(), appflowy_ai_client.clone());
 
   // Pg listeners
   info!("Setting up Pg listeners...");
@@ -226,7 +261,7 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
     metrics.collab_metrics.clone(),
   )
   .await;
-  let collab_storage = Arc::new(CollabStorageImpl::new(
+  let collab_access_control_storage = Arc::new(CollabStorageImpl::new(
     collab_cache.clone(),
     collab_storage_access_control,
     snapshot_control,
@@ -235,17 +270,27 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
     metrics.collab_metrics.clone(),
   ));
 
-  #[cfg(feature = "history")]
-  let grpc_history_client =
-    tonic_proto::history::history_client::HistoryClient::connect(config.grpc_history.addrs.clone())
-      .await?;
+  info!(
+    "Connecting to history server: {}",
+    config.grpc_history.addrs
+  );
+  let channel = tonic::transport::Channel::from_shared(config.grpc_history.addrs.clone())?
+    .keep_alive_timeout(Duration::from_secs(20))
+    .keep_alive_while_idle(true)
+    .connect_lazy();
 
+  let grpc_history_client = Arc::new(Mutex::new(HistoryClient::new(channel)));
   let mailer = Mailer::new(
     config.mailer.smtp_username.clone(),
     config.mailer.smtp_password.expose_secret().clone(),
     &config.mailer.smtp_host,
+    config.mailer.smtp_port,
   )
   .await?;
+  let realtime_shared_state = RealtimeSharedState::new(redis_conn_manager.clone());
+  if let Err(err) = realtime_shared_state.remove_all_connected_users().await {
+    warn!("Failed to remove all connected users: {:?}", err);
+  }
 
   info!("Application state initialized");
   Ok(AppState {
@@ -256,7 +301,7 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
     gotrue_client,
     redis_connection_manager: redis_conn_manager,
     collab_cache,
-    collab_access_control_storage: collab_storage,
+    collab_access_control_storage,
     collab_access_control,
     workspace_access_control,
     bucket_storage,
@@ -266,8 +311,9 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
     gotrue_admin,
     mailer,
     ai_client: appflowy_ai_client,
-    #[cfg(feature = "history")]
     grpc_history_client,
+    realtime_shared_state,
+    indexer_provider,
   })
 }
 
@@ -344,45 +390,79 @@ async fn get_redis_client(redis_uri: &str) -> Result<redis::aio::ConnectionManag
   Ok(manager)
 }
 
-async fn get_aws_s3_bucket(s3_setting: &S3Setting) -> Result<s3::Bucket, Error> {
-  info!("Connecting to S3 bucket with setting: {:?}", &s3_setting);
-  let region = {
-    match s3_setting.use_minio {
-      true => s3::Region::Custom {
-        region: s3_setting.region.to_owned(),
-        endpoint: s3_setting.minio_url.to_owned(),
-      },
-      false => s3_setting
-        .region
-        .parse::<s3::Region>()
-        .context("failed to parser s3 setting")?,
-    }
+pub async fn get_aws_s3_client(s3_setting: &S3Setting) -> Result<aws_sdk_s3::Client, Error> {
+  let credentials = Credentials::new(
+    s3_setting.access_key.clone(),
+    s3_setting.secret_key.expose_secret().clone(),
+    None,
+    None,
+    "custom",
+  );
+  let shared_credentials = SharedCredentialsProvider::new(credentials);
+
+  // Configure the AWS SDK
+  let config_builder = aws_sdk_s3::Config::builder()
+    .credentials_provider(shared_credentials)
+    .force_path_style(true)
+    .region(Region::new(s3_setting.region.clone()));
+
+  let config = if s3_setting.use_minio {
+    config_builder.endpoint_url(&s3_setting.minio_url).build()
+  } else {
+    config_builder.build()
+  };
+  let client = aws_sdk_s3::Client::from_conf(config);
+  create_bucket_if_not_exists(&client, s3_setting).await?;
+  Ok(client)
+}
+
+async fn create_bucket_if_not_exists(
+  client: &aws_sdk_s3::Client,
+  s3_setting: &S3Setting,
+) -> Result<(), Error> {
+  let bucket_cfg = if s3_setting.use_minio {
+    CreateBucketConfiguration::builder()
+      .bucket(BucketInfo::builder().r#type(BucketType::Directory).build())
+      .build()
+  } else {
+    CreateBucketConfiguration::builder()
+      .location_constraint(BucketLocationConstraint::from(s3_setting.region.as_str()))
+      .build()
   };
 
-  let cred = s3::creds::Credentials {
-    access_key: Some(s3_setting.access_key.to_owned()),
-    secret_key: Some(s3_setting.secret_key.expose_secret().to_owned()),
-    security_token: None,
-    session_token: None,
-    expiration: None,
-  };
-
-  match s3::Bucket::create_with_path_style(
-    &s3_setting.bucket,
-    region.clone(),
-    cred.clone(),
-    s3::BucketConfiguration::default(),
-  )
-  .await
+  match client
+    .create_bucket()
+    .bucket(&s3_setting.bucket)
+    .create_bucket_configuration(bucket_cfg)
+    .send()
+    .await
   {
-    Ok(_) => Ok(()),
-    Err(e) => match e {
-      s3::error::S3Error::HttpFailWithBody(409, _) => Ok(()), // Bucket already exists
-      _ => Err(e),
+    Ok(_) => {
+      info!(
+        "bucket created successfully: {}, region: {}",
+        s3_setting.bucket, s3_setting.region
+      );
+      Ok(())
     },
-  }?;
-
-  Ok(s3::Bucket::new(&s3_setting.bucket, region.clone(), cred.clone())?.with_path_style())
+    Err(err) => {
+      if let Some(service_error) = err.as_service_error() {
+        match service_error {
+          CreateBucketError::BucketAlreadyOwnedByYou(_)
+          | CreateBucketError::BucketAlreadyExists(_) => {
+            info!("Bucket already exists");
+            Ok(())
+          },
+          _ => {
+            error!("Unhandle s3 service error: {:?}", err);
+            Err(err.into())
+          },
+        }
+      } else {
+        error!("Failed to create bucket: {:?}", err);
+        Ok(())
+      }
+    },
+  }
 }
 
 async fn get_connection_pool(setting: &DatabaseSetting) -> Result<PgPool, Error> {
@@ -392,7 +472,7 @@ async fn get_connection_pool(setting: &DatabaseSetting) -> Result<PgPool, Error>
     .acquire_timeout(Duration::from_secs(10))
     .max_lifetime(Duration::from_secs(30 * 60))
     .idle_timeout(Duration::from_secs(30))
-    .connect_with(setting.with_db())
+    .connect_with(setting.pg_connect_options())
     .await
     .map_err(|e| anyhow::anyhow!("Failed to connect to postgres database: {}", e))
 }

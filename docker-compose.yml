@@ -27,7 +27,9 @@ services:
 
   postgres:
     restart: on-failure
-    image: postgres
+    build:
+      context: ./postgres
+      dockerfile: postgres.Dockerfile
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_DB=${POSTGRES_DB:-postgres}
@@ -40,8 +42,6 @@ services:
   redis:
     restart: on-failure
     image: redis
-    ports:
-      - "6379:6379"
 
   gotrue:
     restart: on-failure
@@ -107,9 +107,15 @@ services:
       - APPFLOWY_S3_SECRET_KEY=${APPFLOWY_S3_SECRET_KEY}
       - APPFLOWY_S3_BUCKET=${APPFLOWY_S3_BUCKET}
       - APPFLOWY_S3_REGION=${APPFLOWY_S3_REGION}
+      - APPFLOWY_MAILER_SMTP_HOST=${APPFLOWY_MAILER_SMTP_HOST}
+      - APPFLOWY_MAILER_SMTP_PORT=${APPFLOWY_MAILER_SMTP_PORT}
+      - APPFLOWY_MAILER_SMTP_USERNAME=${APPFLOWY_MAILER_SMTP_USERNAME}
+      - APPFLOWY_MAILER_SMTP_PASSWORD=${APPFLOWY_MAILER_SMTP_PASSWORD}
       - APPFLOWY_ACCESS_CONTROL=${APPFLOWY_ACCESS_CONTROL}
+      - APPFLOWY_DATABASE_MAX_CONNECTIONS=${APPFLOWY_DATABASE_MAX_CONNECTIONS}
       - APPFLOWY_AI_SERVER_HOST=${APPFLOWY_AI_SERVER_HOST}
       - APPFLOWY_AI_SERVER_PORT=${APPFLOWY_AI_SERVER_PORT}
+      - APPFLOWY_OPENAI_API_KEY=${APPFLOWY_OPENAI_API_KEY}
     build:
       context: .
       dockerfile: Dockerfile
@@ -129,15 +135,13 @@ services:
       - ADMIN_FRONTEND_GOTRUE_URL=${ADMIN_FRONTEND_GOTRUE_URL:-http://gotrue:9999}
       - ADMIN_FRONTEND_APPFLOWY_CLOUD_URL=${ADMIN_FRONTEND_APPFLOWY_CLOUD_URL:-http://appflowy_cloud:8000}
 
-  appflowy_ai:
+  ai:
     restart: on-failure
     image: appflowyinc/appflowy_ai:${APPFLOWY_AI_VERSION:-latest}
-    ports:
-      - "5001:5001"
     environment:
       - OPENAI_API_KEY=${APPFLOWY_AI_OPENAI_API_KEY}
-      - APPFLOWY_AI_SERVER_HOST=${APPFLOWY_AI_SERVER_HOST}
       - APPFLOWY_AI_SERVER_PORT=${APPFLOWY_AI_SERVER_PORT}
+      - APPFLOWY_AI_DATABASE_URL=${APPFLOWY_AI_DATABASE_URL}
 
   appflowy_history:
     restart: on-failure
@@ -145,8 +149,6 @@ services:
     build:
       context: .
       dockerfile: ./services/appflowy-history/Dockerfile
-    ports:
-      - "50051:50051"
     environment:
       - RUST_LOG=${RUST_LOG:-info}
       - APPFLOWY_HISTORY_REDIS_URL=redis://redis:6379

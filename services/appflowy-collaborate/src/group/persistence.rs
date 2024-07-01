@@ -9,10 +9,11 @@ use database_entity::dto::CollabParams;
 
 use collab::core::collab::{MutexCollab, WeakMutexCollab};
 
+use crate::indexer::Indexer;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::{interval, sleep};
+use tokio::time::interval;
 use tracing::{error, trace, warn};
 
 pub(crate) struct GroupPersistence<S> {
@@ -23,12 +24,15 @@ pub(crate) struct GroupPersistence<S> {
   edit_state: Arc<EditState>,
   mutex_collab: WeakMutexCollab,
   collab_type: CollabType,
+  persistence_interval: Duration,
+  indexer: Option<Arc<dyn Indexer>>,
 }
 
 impl<S> GroupPersistence<S>
 where
   S: CollabStorage,
 {
+  #[allow(clippy::too_many_arguments)]
   pub fn new(
     workspace_id: String,
     object_id: String,
@@ -37,6 +41,8 @@ where
     edit_state: Arc<EditState>,
     mutex_collab: WeakMutexCollab,
     collab_type: CollabType,
+    persistence_interval: Duration,
+    ai_client: Option<Arc<dyn Indexer>>,
   ) -> Self {
     Self {
       workspace_id,
@@ -46,14 +52,13 @@ where
       edit_state,
       mutex_collab,
       collab_type,
+      persistence_interval,
+      indexer: ai_client,
     }
   }
 
   pub async fn run(self, mut destroy_group_rx: mpsc::Receiver<MutexCollab>) {
-    let mut interval = interval(Duration::from_secs(60));
-    // TODO(nathan): remove this sleep when creating a new collab, applying all the updates
-    // workarounds for the issue that the collab doesn't contain the required data when first created
-    sleep(Duration::from_secs(5)).await;
+    let mut interval = interval(self.persistence_interval);
     loop {
       tokio::select! {
         _ = interval.tick() => {
@@ -93,10 +98,9 @@ where
     }
 
     // Check if conditions for saving to disk are not met
-    if !self.edit_state.should_save_to_disk() {
-      return Ok(());
+    if self.edit_state.should_save_to_disk() {
+      self.save(false).await?;
     }
-    self.save(false).await?;
     Ok(())
   }
 
@@ -110,6 +114,11 @@ where
       None => return Err(AppError::Internal(anyhow!("collab has been dropped"))),
     };
 
+    let collab_embedding = if let Some(indexer) = &self.indexer {
+      indexer.index(collab.clone()).await?
+    } else {
+      None
+    };
     let result = tokio::task::spawn_blocking(move || {
       // Attempt to lock the collab; skip saving if unable
       let lock_guard = collab
@@ -121,7 +130,8 @@ where
     .await;
 
     match result {
-      Ok(Ok(params)) => {
+      Ok(Ok(mut params)) => {
+        params.embeddings = collab_embedding;
         match self
           .storage
           .insert_or_update_collab(&self.workspace_id, &self.uid, params, write_immediately)
@@ -198,6 +208,7 @@ fn get_encode_collab(
     object_id: object_id.to_string(),
     encoded_collab_v1: encoded_collab,
     collab_type: collab_type.clone(),
+    embeddings: None,
   };
   Ok(params)
 }

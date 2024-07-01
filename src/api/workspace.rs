@@ -1,40 +1,43 @@
-use crate::api::util::{compress_type_from_header_value, device_id_from_headers, CollabValidator};
-use crate::api::ws::RealtimeServerAddr;
-use crate::biz;
-use crate::biz::actix_ws::entities::ClientStreamMessage;
-use crate::biz::collab::access_control::CollabAccessControl;
-use crate::biz::user::auth::jwt::UserUuid;
-use crate::biz::workspace;
-use crate::domain::compression::{decompress, CompressionType, X_COMPRESSION_TYPE};
-use crate::state::AppState;
+use crate::api::util::PayloadReader;
 use actix_web::web::{Bytes, Payload};
 use actix_web::web::{Data, Json, PayloadConfig};
 use actix_web::{web, Scope};
 use actix_web::{HttpRequest, Result};
 use anyhow::{anyhow, Context};
-use app_error::AppError;
 use bytes::BytesMut;
+use collab::entity::EncodedCollab;
 use collab_entity::CollabType;
+use futures_util::future::try_join_all;
+use prost::Message as ProstMessage;
+use sqlx::types::uuid;
+use tokio::time::Instant;
+use tokio_stream::StreamExt;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{error, event, instrument, trace};
+use uuid::Uuid;
+use validator::Validate;
 
+use access_control::collab::CollabAccessControl;
+use app_error::AppError;
+use appflowy_collaborate::actix_ws::entities::ClientStreamMessage;
+use appflowy_collaborate::indexer::IndexerProvider;
+use authentication::jwt::UserUuid;
 use collab_rt_entity::realtime_proto::HttpRealtimeMessage;
 use collab_rt_entity::RealtimeMessage;
 use collab_rt_protocol::validate_encode_collab;
 use database::collab::CollabStorage;
 use database::user::select_uid_from_email;
 use database_entity::dto::*;
-use prost::Message as ProstMessage;
-use shared_entity::dto::ai_dto::{SummarizeRowData, SummarizeRowParams, SummarizeRowResponse};
 use shared_entity::dto::workspace_dto::*;
 use shared_entity::response::AppResponseError;
 use shared_entity::response::{AppResponse, JsonAppResponse};
-use sqlx::types::uuid;
-use std::time::Duration;
-use tokio::time::{sleep, Instant};
-use tokio_stream::StreamExt;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, event, instrument};
-use uuid::Uuid;
-use validator::Validate;
+
+use crate::api::util::{compress_type_from_header_value, device_id_from_headers, CollabValidator};
+use crate::api::ws::RealtimeServerAddr;
+use crate::biz;
+use crate::biz::workspace;
+use crate::domain::compression::{decompress, CompressionType, X_COMPRESSION_TYPE};
+use crate::state::AppState;
 
 pub const WORKSPACE_ID_PATH: &str = "workspace_id";
 pub const COLLAB_OBJECT_ID_PATH: &str = "object_id";
@@ -44,12 +47,12 @@ pub const WORKSPACE_MEMBER_PATTERN: &str = "/api/workspace/{workspace_id}/member
 pub const WORKSPACE_INVITE_PATTERN: &str = "/api/workspace/{workspace_id}/invite";
 pub const COLLAB_PATTERN: &str = "/api/workspace/{workspace_id}/collab/{object_id}";
 pub const V1_COLLAB_PATTERN: &str = "/api/workspace/v1/{workspace_id}/collab/{object_id}";
+pub const WORKSPACE_PUBLISH_PATTERN: &str = "/api/workspace/{workspace_id}/publish";
+pub const WORKSPACE_PUBLISH_NAMESPACE_PATTERN: &str =
+  "/api/workspace/{workspace_id}/publish-namespace";
 
 pub fn workspace_scope() -> Scope {
   web::scope("/api/workspace")
-    // deprecated, use the api below instead
-    .service(web::resource("/list").route(web::get().to(list_workspace_handler)))
-
     .service(web::resource("")
       .route(web::get().to(list_workspace_handler))
       .route(web::post().to(create_workspace_handler))
@@ -70,14 +73,20 @@ pub fn workspace_scope() -> Scope {
     .service(web::resource("/{workspace_id}")
       .route(web::delete().to(delete_workspace_handler))
     )
+    .service(web::resource("/{workspace_id}/settings")
+        .route(web::get().to(get_workspace_settings_handler))
+        .route(web::post().to(post_workspace_settings_handler))
+    )
     .service(web::resource("/{workspace_id}/open").route(web::put().to(open_workspace_handler)))
     .service(web::resource("/{workspace_id}/leave").route(web::post().to(leave_workspace_handler)))
     .service(
       web::resource("/{workspace_id}/member")
-        .route(web::get().to(get_workspace_members_handler))
-        .route(web::post().to(create_workspace_members_handler)) // deprecated, use invite flow instead
-        .route(web::put().to(update_workspace_member_handler))
-        .route(web::delete().to(remove_workspace_member_handler))
+      .route(web::get().to(get_workspace_members_handler))
+      .route(web::put().to(update_workspace_member_handler))
+      .route(web::delete().to(remove_workspace_member_handler))
+    )
+    .service(
+      web::resource("/{workspace_id}/member/user/{user_id}").route(web::get().to(get_workspace_member_handler))
     )
     .service(
       web::resource("/{workspace_id}/collab/{object_id}")
@@ -123,14 +132,36 @@ pub fn workspace_scope() -> Scope {
         .route(web::delete().to(remove_collab_member_handler)),
     )
     .service(
+      web::resource("/published/{publish_namespace}/{publish_name}")
+        .route(web::get().to(get_published_collab_handler))
+    )
+    .service(
+      web::resource("/published/{publish_namespace}/{publish_name}/blob")
+        .route(web::get().to(get_published_collab_blob_handler))
+    )
+    .service(
+      web::resource("/published-info/{view_id}")
+        .route(web::get().to(get_published_collab_info_handler))
+    )
+    .service(
+      web::resource("/{workspace_id}/publish-namespace")
+        .route(web::put().to(put_publish_namespace_handler))
+        .route(web::get().to(get_publish_namespace_handler))
+    )
+    .service(
+      web::resource("/{workspace_id}/publish")
+        .route(web::post().to(post_publish_collabs_handler))
+        .route(web::delete().to(delete_published_collabs_handler))
+    )
+    .service(
       web::resource("/{workspace_id}/collab/{object_id}/member/list")
         .route(web::get().to(get_collab_member_list_handler)),
     )
     .service(
-      web::resource("/{workspace_id}/collab_list").route(web::get().to(batch_get_collab_handler)),
-    )
-    .service(
-      web::resource("/{workspace_id}/summarize_row").route(web::post().to(summary_row_handler)),
+      web::resource("/{workspace_id}/collab_list")
+      .route(web::get().to(batch_get_collab_handler)) // deprecated: browser cannot use json param
+                                                      // for GET request
+      .route(web::post().to(batch_get_collab_handler)),
     )
 }
 
@@ -224,26 +255,6 @@ async fn list_workspace_handler(
   Ok(AppResponse::Ok().with_data(AFWorkspaces(workspaces)).into())
 }
 
-// Deprecated
-#[instrument(skip(payload, state), err)]
-async fn create_workspace_members_handler(
-  user_uuid: UserUuid,
-  workspace_id: web::Path<Uuid>,
-  payload: Json<CreateWorkspaceMembers>,
-  state: Data<AppState>,
-) -> Result<JsonAppResponse<()>> {
-  let create_members = payload.into_inner();
-  workspace::ops::add_workspace_members(
-    &state.pg_pool,
-    &user_uuid,
-    &workspace_id,
-    create_members.0,
-    &state.workspace_access_control,
-  )
-  .await?;
-  Ok(AppResponse::Ok().into())
-}
-
 #[instrument(skip(payload, state), err)]
 async fn post_workspace_invite_handler(
   user_uuid: UserUuid,
@@ -295,6 +306,44 @@ async fn post_accept_workspace_invite_handler(
   Ok(AppResponse::Ok().into())
 }
 
+#[instrument(skip_all, err, fields(user_uuid))]
+async fn get_workspace_settings_handler(
+  user_uuid: UserUuid,
+  state: Data<AppState>,
+  workspace_id: web::Path<Uuid>,
+) -> Result<JsonAppResponse<AFWorkspaceSettings>> {
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let settings = workspace::ops::get_workspace_settings(
+    &state.pg_pool,
+    &state.workspace_access_control,
+    &workspace_id,
+    &uid,
+  )
+  .await?;
+  Ok(AppResponse::Ok().with_data(settings).into())
+}
+
+#[instrument(level = "info", skip_all, err, fields(user_uuid))]
+async fn post_workspace_settings_handler(
+  user_uuid: UserUuid,
+  state: Data<AppState>,
+  workspace_id: web::Path<Uuid>,
+  data: Json<AFWorkspaceSettingsChange>,
+) -> Result<JsonAppResponse<AFWorkspaceSettings>> {
+  let data = data.into_inner();
+  trace!("workspace settings: {:?}", data);
+  let uid = state.user_cache.get_user_uid(&user_uuid).await?;
+  let settings = workspace::ops::update_workspace_settings(
+    &state.pg_pool,
+    &state.workspace_access_control,
+    &workspace_id,
+    &uid,
+    data,
+  )
+  .await?;
+  Ok(AppResponse::Ok().with_data(settings).into())
+}
+
 #[instrument(skip_all, err)]
 async fn get_workspace_members_handler(
   _user_uuid: UserUuid,
@@ -337,6 +386,24 @@ async fn remove_workspace_member_handler(
   .await?;
 
   Ok(AppResponse::Ok().into())
+}
+
+#[instrument(skip_all, err)]
+async fn get_workspace_member_handler(
+  state: Data<AppState>,
+  path: web::Path<(Uuid, i64)>,
+) -> Result<JsonAppResponse<AFWorkspaceMember>> {
+  let (workspace_id, user_id) = path.into_inner();
+  let member_row =
+    workspace::ops::get_workspace_member(&user_id, &state.pg_pool, &workspace_id).await?;
+  let member = AFWorkspaceMember {
+    name: member_row.name,
+    email: member_row.email,
+    role: member_row.role,
+    avatar_url: None,
+  };
+
+  Ok(AppResponse::Ok().with_data(member).into())
 }
 
 #[instrument(level = "debug", skip_all, err)]
@@ -423,7 +490,7 @@ async fn create_collab_handler(
     },
   };
 
-  let (params, workspace_id) = params.split();
+  let (mut params, workspace_id) = params.split();
 
   if params.object_id == workspace_id {
     // Only the object with [CollabType::Folder] can have the same object_id as workspace_id. But
@@ -441,6 +508,25 @@ async fn create_collab_handler(
       ))
       .into(),
     );
+  }
+
+  if state
+    .indexer_provider
+    .can_index_workspace(&workspace_id)
+    .await?
+  {
+    match state
+      .indexer_provider
+      .create_collab_embeddings(&params)
+      .await
+    {
+      Ok(embeddings) => params.embeddings = embeddings,
+      Err(err) => tracing::warn!(
+        "failed to fetch embeddings for document {}: {}",
+        params.object_id,
+        err
+      ),
+    }
   }
 
   let mut transaction = state
@@ -534,6 +620,19 @@ async fn batch_create_collab_handler(
   if collab_params_list.is_empty() {
     return Err(AppError::InvalidRequest("Empty collab params list".to_string()).into());
   }
+  if state
+    .indexer_provider
+    .can_index_workspace(&workspace_id)
+    .await?
+  {
+    if let Err(err) = fetch_embeddings(&state.indexer_provider, &mut collab_params_list).await {
+      tracing::warn!(
+        "failed to fetch embeddings for {} new documents: {}",
+        collab_params_list.len(),
+        err
+      );
+    }
+  }
   for params in collab_params_list {
     let object_id = params.object_id.clone();
     if validate_encode_collab(
@@ -604,13 +703,40 @@ async fn create_collab_list_handler(
     return Err(AppError::InvalidRequest("Empty collab params list".to_string()).into());
   }
 
+  if state
+    .indexer_provider
+    .can_index_workspace(&workspace_id)
+    .await?
+  {
+    if let Err(err) = fetch_embeddings(&state.indexer_provider, &mut valid_items).await {
+      tracing::warn!(
+        "failed to fetch embeddings for {} new documents: {}",
+        valid_items.len(),
+        err
+      );
+    }
+  }
+
+  let mut transaction = state
+    .pg_pool
+    .begin()
+    .await
+    .map_err(|err| AppError::Internal(anyhow!("Failed to start inserting collab: {}", err)))?;
+
   for params in valid_items {
     let _object_id = params.object_id.clone();
     state
       .collab_access_control_storage
-      .insert_new_collab(&workspace_id, &uid, params)
+      .insert_new_collab_with_transaction(&workspace_id, &uid, params, &mut transaction)
       .await?;
   }
+
+  transaction.commit().await.map_err(|err| {
+    AppError::Internal(anyhow!(
+      "Failed to finish inserting list of collab: {}",
+      err
+    ))
+  })?;
 
   Ok(Json(AppResponse::Ok()))
 }
@@ -776,7 +902,28 @@ async fn update_collab_handler(
   let uid = state.user_cache.get_user_uid(&user_uuid).await?;
 
   let create_params = CreateCollabParams::from((workspace_id.to_string(), params));
-  let (params, workspace_id) = create_params.split();
+  let (mut params, workspace_id) = create_params.split();
+  if let Some(indexer) = state
+    .indexer_provider
+    .indexer_for(params.collab_type.clone())
+  {
+    if state
+      .indexer_provider
+      .can_index_workspace(&workspace_id)
+      .await?
+    {
+      let encoded = EncodedCollab::decode_from_bytes(&params.encoded_collab_v1)
+        .map_err(|e| AppError::Internal(e.into()))?;
+      match indexer.index_encoded(&params.object_id, encoded).await {
+        Ok(embeddings) => params.embeddings = embeddings,
+        Err(err) => tracing::warn!(
+          "failed to fetch embeddings for document {}: {}",
+          params.object_id,
+          err
+        ),
+      }
+    }
+  }
   state
     .collab_access_control_storage
     .insert_or_update_collab(&workspace_id, &uid, params, false)
@@ -877,6 +1024,139 @@ async fn remove_collab_member_handler(
   Ok(Json(AppResponse::Ok()))
 }
 
+async fn put_publish_namespace_handler(
+  user_uuid: UserUuid,
+  workspace_id: web::Path<Uuid>,
+  payload: Json<UpdatePublishNamespace>,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<()>>> {
+  let workspace_id = workspace_id.into_inner();
+  let new_namespace = payload.into_inner().new_namespace;
+  biz::workspace::ops::set_workspace_namespace(
+    &state.pg_pool,
+    &user_uuid,
+    &workspace_id,
+    &new_namespace,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok()))
+}
+
+async fn get_publish_namespace_handler(
+  workspace_id: web::Path<Uuid>,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<String>>> {
+  let workspace_id = workspace_id.into_inner();
+  let namespace =
+    biz::workspace::ops::get_workspace_publish_namespace(&state.pg_pool, &workspace_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(namespace)))
+}
+
+async fn get_published_collab_handler(
+  path_param: web::Path<(String, String)>,
+  state: Data<AppState>,
+) -> Result<Json<serde_json::Value>> {
+  let (workspace_namespace, publish_name) = path_param.into_inner();
+  let metadata =
+    biz::workspace::ops::get_published_collab(&state.pg_pool, &workspace_namespace, &publish_name)
+      .await?;
+  Ok(Json(metadata))
+}
+
+async fn get_published_collab_blob_handler(
+  path_param: web::Path<(String, String)>,
+  state: Data<AppState>,
+) -> Result<Vec<u8>> {
+  let (publish_namespace, publish_name) = path_param.into_inner();
+  let collab_data = biz::workspace::ops::get_published_collab_blob(
+    &state.pg_pool,
+    &publish_namespace,
+    &publish_name,
+  )
+  .await?;
+  Ok(collab_data)
+}
+
+async fn get_published_collab_info_handler(
+  view_id: web::Path<Uuid>,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<PublishInfo>>> {
+  let view_id = view_id.into_inner();
+  let collab_data =
+    biz::workspace::ops::get_published_collab_info(&state.pg_pool, &view_id).await?;
+  Ok(Json(AppResponse::Ok().with_data(collab_data)))
+}
+
+async fn post_publish_collabs_handler(
+  workspace_id: web::Path<Uuid>,
+  user_uuid: UserUuid,
+  payload: Payload,
+  state: Data<AppState>,
+) -> Result<Json<AppResponse<()>>> {
+  let workspace_id = workspace_id.into_inner();
+
+  let mut accumulator = Vec::<PublishCollabItem<serde_json::Value, Vec<u8>>>::new();
+  let mut payload_reader: PayloadReader = PayloadReader::new(payload);
+
+  loop {
+    let meta: PublishCollabMetadata<serde_json::Value> = {
+      let meta_len = payload_reader.read_u32_little_endian().await?;
+      if meta_len > 4 * 1024 * 1024 {
+        // 4MB Limit for metadata
+        return Err(AppError::InvalidRequest(String::from("metadata too large")).into());
+      }
+      if meta_len == 0 {
+        break;
+      }
+
+      let mut meta_buffer = vec![0; meta_len as usize];
+      payload_reader.read_exact(&mut meta_buffer).await?;
+      serde_json::from_slice(&meta_buffer)?
+    };
+
+    let data = {
+      let data_len = payload_reader.read_u32_little_endian().await?;
+      if data_len > 128 * 1024 * 1024 {
+        // 128MB Limit for data
+        return Err(AppError::InvalidRequest(String::from("data too large")).into());
+      }
+      let mut data_buffer = vec![0; data_len as usize];
+      payload_reader.read_exact(&mut data_buffer).await?;
+      data_buffer
+    };
+
+    accumulator.push(PublishCollabItem { meta, data });
+  }
+
+  if accumulator.is_empty() {
+    return Ok(Json(AppResponse::Ok()));
+  }
+  biz::workspace::ops::publish_collabs(&state.pg_pool, &workspace_id, &user_uuid, &accumulator)
+    .await?;
+  Ok(Json(AppResponse::Ok()))
+}
+
+async fn delete_published_collabs_handler(
+  workspace_id: web::Path<Uuid>,
+  user_uuid: UserUuid,
+  state: Data<AppState>,
+  view_ids: Json<Vec<Uuid>>,
+) -> Result<Json<AppResponse<()>>> {
+  let workspace_id = workspace_id.into_inner();
+  let view_ids = view_ids.into_inner();
+  if view_ids.is_empty() {
+    return Ok(Json(AppResponse::Ok()));
+  }
+  biz::workspace::ops::delete_published_workspace_collab(
+    &state.pg_pool,
+    &workspace_id,
+    &view_ids,
+    &user_uuid,
+  )
+  .await?;
+  Ok(Json(AppResponse::Ok()))
+}
+
 #[instrument(level = "debug", skip(state, payload), err)]
 async fn get_collab_member_list_handler(
   payload: Json<QueryCollabMembers>,
@@ -910,45 +1190,35 @@ async fn post_realtime_message_stream_handler(
 
   event!(tracing::Level::INFO, "message len: {}", bytes.len());
   let device_id = device_id.to_string();
+  // Only send message to websocket server when the user is connected
+  if !state
+    .realtime_shared_state
+    .is_user_connected(&uid, &device_id)
+    .await
+    .unwrap_or(false)
+  {
+    return Ok(Json(AppResponse::Ok()));
+  }
+
   let message = parser_realtime_msg(bytes.freeze(), req.clone()).await?;
-  let mut stream_message = Some(ClientStreamMessage {
+  let stream_message = ClientStreamMessage {
     uid,
     device_id,
     message,
-  });
-  const MAX_RETRIES: usize = 3;
-  const RETRY_DELAY: Duration = Duration::from_secs(2);
+  };
 
-  let mut attempts = 0;
-  while attempts < MAX_RETRIES {
-    match stream_message.take() {
-      None => {
-        return Err(AppError::Internal(anyhow!("Unexpected empty stream message")).into());
-      },
-      Some(message_to_send) => {
-        match server.try_send(message_to_send) {
-          Ok(_) => return Ok(Json(AppResponse::Ok())),
-          Err(err) if attempts < MAX_RETRIES - 1 => {
-            attempts += 1;
-            stream_message = Some(err.into_inner());
-            sleep(RETRY_DELAY).await;
-          },
-          Err(err) => {
-            return Err(
-              AppError::Internal(anyhow!(
-                "Failed to send client stream message to websocket server after {} attempts: {}",
-                // attempts starts from 0, so add 1 for accurate count
-                attempts + 1,
-                err
-              ))
-              .into(),
-            );
-          },
-        }
-      },
-    }
+  // When the server is under heavy load, try_send may fail. In client side, it will retry to send
+  // the message later.
+  match server.try_send(stream_message) {
+    Ok(_) => return Ok(Json(AppResponse::Ok())),
+    Err(err) => Err(
+      AppError::Internal(anyhow!(
+        "Failed to send message to websocket server, error:{}",
+        err
+      ))
+      .into(),
+    ),
   }
-  Err(AppError::Internal(anyhow!("Failed to send message to websocket server")).into())
 }
 
 async fn get_workspace_usage_handler(
@@ -1008,39 +1278,20 @@ async fn parser_realtime_msg(
   }
 }
 
-#[instrument(level = "debug", skip(state, payload), err)]
-async fn summary_row_handler(
-  state: Data<AppState>,
-  payload: Json<SummarizeRowParams>,
-) -> Result<Json<AppResponse<SummarizeRowResponse>>> {
-  let params = payload.into_inner();
-  match params.data {
-    SummarizeRowData::Identity { .. } => {
-      return Err(AppError::InvalidRequest("Identity data is not supported".to_string()).into());
-    },
-    SummarizeRowData::Content(content) => {
-      if content.is_empty() {
-        return Ok(
-          AppResponse::Ok()
-            .with_data(SummarizeRowResponse {
-              text: "No content".to_string(),
-            })
-            .into(),
-        );
-      }
-
-      let result = state.ai_client.summarize_row(&content).await;
-      let resp = match result {
-        Ok(resp) => SummarizeRowResponse { text: resp.text },
-        Err(err) => {
-          error!("Failed to summarize row: {:?}", err);
-          SummarizeRowResponse {
-            text: "No content".to_string(),
-          }
-        },
-      };
-
-      Ok(AppResponse::Ok().with_data(resp).into())
-    },
+async fn fetch_embeddings(
+  indexer_provider: &IndexerProvider,
+  params: &mut [CollabParams],
+) -> Result<(), AppError> {
+  let mut futures = Vec::with_capacity(params.len());
+  for param in params.iter() {
+    let future = indexer_provider.create_collab_embeddings(param);
+    futures.push(future);
   }
+
+  let results = try_join_all(futures).await?;
+  for (i, embeddings) in results.into_iter().enumerate() {
+    params[i].embeddings = embeddings;
+  }
+
+  Ok(())
 }

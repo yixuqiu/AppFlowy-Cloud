@@ -29,6 +29,9 @@ use yrs::updates::decoder::DecoderV1;
 use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
 use yrs::Subscription as YrsSubscription;
 
+pub trait CollabUpdateStreaming: 'static + Send + Sync {
+  fn send_update(&self, update: Vec<u8>) -> Result<(), RealtimeError>;
+}
 /// A broadcast can be used to propagate updates produced by yrs [yrs::Doc] and [Awareness]
 /// to subscribes. One broadcast can be used to propagate updates for a single document with
 /// object_id.
@@ -43,6 +46,7 @@ pub struct CollabBroadcast {
   edit_state: Arc<EditState>,
   /// The last modified time of the document.
   pub modified_at: Arc<parking_lot::Mutex<Instant>>,
+  update_streaming: Arc<dyn CollabUpdateStreaming>,
 }
 
 unsafe impl Send for CollabBroadcast {}
@@ -61,12 +65,14 @@ impl CollabBroadcast {
   ///
   /// The overflow of the incoming events that needs to be propagates will be buffered up to a
   /// provided `buffer_capacity` size.
-  pub async fn new(
+  pub fn new(
     object_id: &str,
     buffer_capacity: usize,
     edit_state: Arc<EditState>,
     collab: &MutexCollab,
+    update_streaming: impl CollabUpdateStreaming,
   ) -> Self {
+    let update_streaming = Arc::new(update_streaming);
     let object_id = object_id.to_owned();
     // broadcast channel
     let (sender, _) = channel(buffer_capacity);
@@ -77,18 +83,20 @@ impl CollabBroadcast {
       doc_subscription: Default::default(),
       edit_state,
       modified_at: Arc::new(parking_lot::Mutex::new(Instant::now())),
+      update_streaming,
     };
-    this.observe_collab_changes(collab).await;
+    this.observe_collab_changes(collab);
     this
   }
 
-  async fn observe_collab_changes(&mut self, collab: &MutexCollab) {
+  fn observe_collab_changes(&mut self, collab: &MutexCollab) {
     let (doc_sub, awareness_sub) = {
       // Observer the document's update and broadcast it to all subscribers.
       let cloned_oid = self.object_id.clone();
       let broadcast_sink = self.broadcast_sender.clone();
       let modified_at = self.modified_at.clone();
       let edit_state = self.edit_state.clone();
+      let update_streaming = self.update_streaming.clone();
 
       // Observer the document's update and broadcast it to all subscribers. When one of the clients
       // sends an update to the document that alters its state, the document observer will trigger
@@ -105,6 +113,11 @@ impl CollabBroadcast {
             event.update.len(),
             origin
           );
+
+          let stream_update = event.update.clone();
+          if let Err(err) = update_streaming.send_update(stream_update) {
+            warn!("fail to send updates to redis:{}", err)
+          }
           let payload = gen_update_message(&event.update);
           let msg = BroadcastSync::new(origin, cloned_oid.clone(), payload, seq_num);
           if let Err(err) = broadcast_sink.send(msg.into()) {
@@ -176,7 +189,6 @@ impl CollabBroadcast {
     Stream: StreamExt<Item = MessageByObjectId> + Send + Sync + Unpin + 'static,
     <Sink as futures_util::Sink<CollabMessage>>::Error: std::error::Error + Send + Sync,
   {
-    let cloned_origin = subscriber_origin.clone();
     let sink_stop_tx = {
       let mut sink = sink.clone();
       let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -253,7 +265,6 @@ impl CollabBroadcast {
     };
 
     Subscription {
-      origin: cloned_origin,
       sink_stop_tx: Some(sink_stop_tx),
       stream_stop_tx: Some(stream_stop_tx),
     }
@@ -527,7 +538,6 @@ fn ack_code_from_error(error: &RTProtocolError) -> AckCode {
 /// connection error or closed connection).
 #[derive(Debug)]
 pub struct Subscription {
-  pub origin: CollabOrigin,
   sink_stop_tx: Option<tokio::sync::mpsc::Sender<()>>,
   stream_stop_tx: Option<tokio::sync::mpsc::Sender<()>>,
 }

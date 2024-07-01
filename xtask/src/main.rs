@@ -5,6 +5,7 @@ use tokio::select;
 /// Using 'cargo run --package xtask' to run servers in parallel.
 /// 1. AppFlowy Cloud
 /// 2. AppFlowy History
+/// 3. AppFlowy Indexer
 ///
 /// Before running this command, make sure the other dependencies servers are running. For example,
 /// Redis, Postgres, etc.
@@ -17,7 +18,7 @@ async fn main() -> Result<()> {
   kill_existing_process(appflowy_history_bin_name).await?;
 
   let mut appflowy_cloud_cmd = Command::new("cargo")
-    .args(["run", "--features", ""])
+    .args(["run", "--features", "history"])
     .spawn()
     .context("Failed to start AppFlowy-Cloud process")?;
 
@@ -36,7 +37,7 @@ async fn main() -> Result<()> {
       },
       status = appflowy_history_cmd.wait() => {
           handle_process_exit(status?, appflowy_history_bin_name)?;
-      },
+      }
   }
 
   Ok(())
