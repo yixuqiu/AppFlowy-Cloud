@@ -1,30 +1,36 @@
 use crate::collab::partition_key_from_collab_type;
+
 use collab_entity::CollabType;
 use serde::{Deserialize, Serialize};
 use sqlx::{Executor, FromRow, PgPool, Postgres};
 use std::ops::DerefMut;
-use tonic_proto::history::{HistoryState, SnapshotInfo, SnapshotMeta};
+use tonic_proto::history::{HistoryStatePb, SingleSnapshotInfoPb, SnapshotMetaPb};
+use tracing::trace;
 use uuid::Uuid;
 
 #[allow(clippy::too_many_arguments)]
-pub async fn insert_history<'a>(
+pub async fn insert_history(
   workspace_id: &Uuid,
-  oid: &str,
+  oid: &Uuid,
   doc_state: Vec<u8>,
   doc_state_version: i32,
-  deps_snapshot_id: Option<String>,
+  deps_snapshot_id: Option<&Uuid>,
   collab_type: CollabType,
   created_at: i64,
-  snapshots: Vec<SnapshotMeta>,
+  snapshots: Vec<SnapshotMetaPb>,
   pool: PgPool,
 ) -> Result<(), sqlx::Error> {
   let mut transaction = pool.begin().await?;
   let partition_key = partition_key_from_collab_type(&collab_type);
-  let to_insert: Vec<SnapshotMeta> = snapshots
+  let to_insert: Vec<SnapshotMetaPb> = snapshots
     .into_iter()
     .filter(|s| s.created_at <= created_at)
     .collect();
 
+  trace!(
+    "Inserting {} snapshots into af_snapshot_meta",
+    to_insert.len()
+  );
   for snapshot in to_insert {
     insert_snapshot_meta(
       workspace_id,
@@ -55,8 +61,8 @@ pub async fn insert_history<'a>(
 
 async fn insert_snapshot_meta<'a, E: Executor<'a, Database = Postgres>>(
   workspace_id: &Uuid,
-  oid: &str,
-  meta: SnapshotMeta,
+  oid: &Uuid,
+  meta: SnapshotMetaPb,
   partition_key: i32,
   executor: E,
 ) -> Result<(), sqlx::Error> {
@@ -64,8 +70,9 @@ async fn insert_snapshot_meta<'a, E: Executor<'a, Database = Postgres>>(
     r#"
     INSERT INTO af_snapshot_meta (oid, workspace_id, snapshot, snapshot_version, partition_key, created_at)
     VALUES ($1, $2, $3, $4, $5, $6)
+    ON CONFLICT DO NOTHING
     "#,
-    oid,
+    oid.to_string(),
     workspace_id,
     meta.snapshot,
     meta.snapshot_version,
@@ -85,25 +92,27 @@ async fn insert_snapshot_meta<'a, E: Executor<'a, Database = Postgres>>(
 /// - `pool`: The PostgreSQL connection pool.
 ///
 /// # Returns
-/// Returns a vector of `AFSnapshotMetaRow` struct instances containing the snapshot data.
+/// Returns a vector of `AFSnapshotMetaPbRow` struct instances containing the snapshot data.
 /// This vector is empty if no records match the criteria.
-pub async fn get_snapshot_meta_list<'a>(
-  oid: &str,
+pub async fn get_snapshot_meta_list(
+  oid: &Uuid,
   collab_type: &CollabType,
   pool: &PgPool,
-) -> Result<Vec<AFSnapshotMetaRow>, sqlx::Error> {
+) -> Result<Vec<AFSnapshotMetaPbRow>, sqlx::Error> {
   let partition_key = partition_key_from_collab_type(collab_type);
-  let order_clause = "DESC";
-  let query = format!(
-        "SELECT oid, snapshot, snapshot_version, created_at FROM af_snapshot_meta WHERE oid = $1 AND partition_key = $2 ORDER BY created_at {}",
-        order_clause
-    );
 
-  let rows = sqlx::query_as::<_, AFSnapshotMetaRow>(&query)
-    .bind(oid)
-    .bind(partition_key)
-    .fetch_all(pool)
-    .await?;
+  let rows: Vec<_> = sqlx::query_as!(
+    AFSnapshotMetaPbRow,
+    r#"
+    SELECT oid, snapshot, snapshot_version, created_at
+    FROM af_snapshot_meta
+    WHERE oid = $1 AND partition_key = $2
+    ORDER BY created_at DESC"#,
+    oid.to_string(),
+    partition_key
+  )
+  .fetch_all(pool)
+  .await?;
 
   Ok(rows)
 }
@@ -123,24 +132,20 @@ pub async fn get_snapshot_meta_list<'a>(
 #[allow(clippy::too_many_arguments)]
 async fn insert_snapshot_state<'a, E: Executor<'a, Database = Postgres>>(
   workspace_id: &Uuid,
-  oid: &str,
+  oid: &Uuid,
   doc_state: Vec<u8>,
   doc_state_version: i32,
-  deps_snapshot_id: Option<String>,
+  deps_snapshot_id: Option<&Uuid>,
   partition_key: i32,
   created_at: i64,
   executor: E,
 ) -> Result<(), sqlx::Error> {
-  let deps_snapshot_id = match deps_snapshot_id {
-    Some(id) => Uuid::parse_str(&id).ok(),
-    None => None,
-  };
   sqlx::query!(
     r#"
     INSERT INTO af_snapshot_state (oid, workspace_id, doc_state, doc_state_version, deps_snapshot_id, partition_key, created_at)
     VALUES ($1, $2, $3, $4, $5, $6, $7)
     "#,
-    oid,
+    oid.to_string(),
     workspace_id,
     doc_state,
     doc_state_version,
@@ -148,8 +153,8 @@ async fn insert_snapshot_state<'a, E: Executor<'a, Database = Postgres>>(
     partition_key,
     created_at,
   )
-        .execute(executor)
-        .await?;
+  .execute(executor)
+  .await?;
   Ok(())
 }
 
@@ -157,7 +162,7 @@ async fn insert_snapshot_state<'a, E: Executor<'a, Database = Postgres>>(
 /// that has a `created_at` timestamp greater than or equal to the specified timestamp.
 ///
 pub async fn get_latest_snapshot_state<'a, E: Executor<'a, Database = Postgres>>(
-  oid: &str,
+  oid: &Uuid,
   timestamp: i64,
   collab_type: &CollabType,
   executor: E,
@@ -172,7 +177,7 @@ pub async fn get_latest_snapshot_state<'a, E: Executor<'a, Database = Postgres>>
         ORDER BY created_at ASC
         LIMIT 1
         "#,
-    oid,
+    oid.to_string(),
     partition_key,
     timestamp,
   )
@@ -183,15 +188,15 @@ pub async fn get_latest_snapshot_state<'a, E: Executor<'a, Database = Postgres>>
 
 /// Gets the latest snapshot for the specified object identifier and partition key.
 pub async fn get_latest_snapshot(
-  oid: &str,
+  oid: &Uuid,
   collab_type: &CollabType,
   pool: &PgPool,
-) -> Result<Option<SnapshotInfo>, sqlx::Error> {
+) -> Result<Option<SingleSnapshotInfoPb>, sqlx::Error> {
   let mut transaction = pool.begin().await?;
   let partition_key = partition_key_from_collab_type(collab_type);
   // Attempt to fetch the latest snapshot metadata
   let snapshot_meta = sqlx::query_as!(
-    AFSnapshotMetaRow,
+    AFSnapshotMetaPbRow,
     r#"
         SELECT oid, snapshot, snapshot_version, created_at
         FROM af_snapshot_meta
@@ -199,7 +204,7 @@ pub async fn get_latest_snapshot(
         ORDER BY created_at DESC
         LIMIT 1
         "#,
-    oid,
+    oid.to_string(),
     partition_key,
   )
   .fetch_optional(transaction.deref_mut())
@@ -207,41 +212,45 @@ pub async fn get_latest_snapshot(
 
   // Return None if no metadata found
   let snapshot_meta = match snapshot_meta {
-    Some(meta) => meta,
+    Some(meta) => SnapshotMetaPb {
+      oid: meta.oid,
+      snapshot: meta.snapshot,
+      snapshot_version: meta.snapshot_version,
+      created_at: meta.created_at,
+    },
     None => return Ok(None),
   };
 
   // Fetch the corresponding state using the metadata's created_at timestamp
-  let snapshot_state = get_latest_snapshot_state(
+  // Return None if no metadata found
+  let snapshot_state = match get_latest_snapshot_state(
     oid,
     snapshot_meta.created_at,
     collab_type,
     transaction.deref_mut(),
   )
-  .await?;
-
-  // Return None if no metadata found
-  let snapshot_state = match snapshot_state {
+  .await?
+  {
     Some(state) => state,
     None => return Ok(None),
   };
+  transaction.commit().await?;
 
-  let history_state = HistoryState {
+  let history_state = HistoryStatePb {
     object_id: snapshot_state.oid,
     doc_state: snapshot_state.doc_state,
     doc_state_version: snapshot_state.doc_state_version,
   };
 
-  let snapshot_info = SnapshotInfo {
-    snapshot: snapshot_meta.snapshot,
+  let snapshot_info = SingleSnapshotInfoPb {
+    snapshot_meta: Some(snapshot_meta),
     history_state: Some(history_state),
   };
 
   Ok(Some(snapshot_info))
 }
-
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct AFSnapshotMetaRow {
+pub struct AFSnapshotMetaPbRow {
   pub oid: String,
   pub snapshot: Vec<u8>,
   pub snapshot_version: i32,

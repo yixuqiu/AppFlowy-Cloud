@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct JsonResponse<T> {
   pub code: u16,
   pub data: T,
@@ -16,24 +17,16 @@ pub struct UserUsageLimit {
 pub struct WorkspaceUsageLimits {
   pub name: String,
   pub member_count: usize,
-  pub member_limit: String,
   pub total_doc_size: String,
   pub total_blob_size: String,
-  pub total_blob_limit: String,
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct WorkspaceMember {
   pub name: String,
   pub email: String,
   pub role: String,
-}
-
-#[derive(Deserialize)]
-pub struct WorkspaceUsageLimit {
-  pub total_blob_size: i64,
-  pub single_blob_size: i64,
-  pub member_count: i64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -47,6 +40,7 @@ pub struct WorkspaceDocUsage {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct UserProfile {
   pub uid: i64,
   pub uuid: Uuid,

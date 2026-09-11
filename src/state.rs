@@ -1,31 +1,41 @@
-use crate::api::metrics::RequestMetrics;
-use crate::biz::casbin::{CollabAccessControlImpl, WorkspaceAccessControlImpl};
-use crate::biz::collab::cache::CollabCache;
-use crate::biz::collab::metrics::CollabMetrics;
-use crate::biz::collab::storage::CollabAccessControlStorage;
-
-use crate::biz::pg_listener::PgListeners;
-use crate::config::config::Config;
-use crate::mailer::Mailer;
-use access_control::access::AccessControl;
-use access_control::metrics::AccessControlMetrics;
-use app_error::AppError;
-use appflowy_ai_client::client::AppFlowyAIClient;
-use appflowy_collaborate::CollabRealtimeMetrics;
+use access_control::collab::{CollabAccessControl, RealtimeAccessControl};
+use access_control::workspace::WorkspaceAccessControl;
+use actix::Addr;
+use anyhow::anyhow;
 use dashmap::DashMap;
-use database::file::bucket_s3_impl::S3BucketStorage;
-use database::user::{select_all_uid_uuid, select_uid_from_uuid};
-use gotrue::grant::{Grant, PasswordGrant};
+use gotrue_entity::gotrue_jwt::GoTrueServiceRoleClaims;
 use secrecy::{ExposeSecret, Secret};
-use snowflake::Snowflake;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-pub type RedisConnectionManager = redis::aio::ConnectionManager;
+use access_control::metrics::AccessControlMetrics;
+use app_error::AppError;
+use appflowy_ai_client::client::AppFlowyAIClient;
+use appflowy_collaborate::collab::cache::CollabCache;
+use appflowy_collaborate::metrics::CollabMetrics;
+use appflowy_collaborate::ws2::WsServer;
+use appflowy_collaborate::CollabRealtimeMetrics;
+use collab_stream::awareness_gossip::AwarenessGossip;
+use collab_stream::metrics::CollabStreamMetrics;
+use collab_stream::stream_router::StreamRouter;
+use database::collab::CollabStore;
+use database::file::s3_client_impl::{AwsS3BucketClientImpl, S3BucketStorage};
+use database::user::{select_all_uid_uuid, select_uid_from_uuid};
+use indexer::metrics::EmbeddingMetrics;
+use indexer::scheduler::IndexerScheduler;
+use snowflake::Snowflake;
 
+use crate::api::metrics::{AppFlowyWebMetrics, PublishedCollabMetrics, RequestMetrics};
+use crate::biz::chat::metrics::AIMetrics;
+use crate::biz::pg_listener::PgListeners;
+use crate::biz::workspace::publish::PublishedCollabStore;
+use crate::config::config::Config;
+use crate::mailer::AFCloudMailer;
+
+pub type RedisConnectionManager = redis::aio::ConnectionManager;
 #[derive(Clone)]
 pub struct AppState {
   pub pg_pool: PgPool,
@@ -33,21 +43,24 @@ pub struct AppState {
   pub user_cache: UserCache,
   pub id_gen: Arc<RwLock<Snowflake>>,
   pub gotrue_client: gotrue::api::Client,
+  pub redis_stream_router: Arc<StreamRouter>,
+  pub awareness_gossip: Arc<AwarenessGossip>,
   pub redis_connection_manager: RedisConnectionManager,
-  pub collab_cache: CollabCache,
-  pub collab_access_control_storage: Arc<CollabAccessControlStorage>,
-  pub collab_access_control: CollabAccessControlImpl,
-  pub workspace_access_control: WorkspaceAccessControlImpl,
+  pub collab_cache: Arc<CollabCache>,
+  pub collab_storage: Arc<dyn CollabStore>,
+  pub collab_access_control: Arc<dyn CollabAccessControl>,
+  pub workspace_access_control: Arc<dyn WorkspaceAccessControl>,
+  pub realtime_access_control: Arc<dyn RealtimeAccessControl>,
   pub bucket_storage: Arc<S3BucketStorage>,
+  pub published_collab_store: Arc<dyn PublishedCollabStore>,
+  pub bucket_client: AwsS3BucketClientImpl,
   pub pg_listeners: Arc<PgListeners>,
-  pub access_control: AccessControl,
   pub metrics: AppMetrics,
   pub gotrue_admin: GoTrueAdmin,
-  pub mailer: Mailer,
+  pub mailer: AFCloudMailer,
   pub ai_client: AppFlowyAIClient,
-  #[cfg(feature = "history")]
-  pub grpc_history_client:
-    tonic_proto::history::history_client::HistoryClient<tonic::transport::Channel>,
+  pub indexer_scheduler: Arc<IndexerScheduler>,
+  pub ws_server: Addr<WsServer>,
 }
 
 impl AppState {
@@ -116,6 +129,11 @@ pub struct AppMetrics {
   pub realtime_metrics: Arc<CollabRealtimeMetrics>,
   pub access_control_metrics: Arc<AccessControlMetrics>,
   pub collab_metrics: Arc<CollabMetrics>,
+  pub published_collab_metrics: Arc<PublishedCollabMetrics>,
+  pub appflowy_web_metrics: Arc<AppFlowyWebMetrics>,
+  pub embedding_metrics: Arc<EmbeddingMetrics>,
+  pub collab_stream_metrics: Arc<CollabStreamMetrics>,
+  pub ai_metrics: Arc<AIMetrics>,
 }
 
 impl Default for AppMetrics {
@@ -131,37 +149,48 @@ impl AppMetrics {
     let realtime_metrics = Arc::new(CollabRealtimeMetrics::register(&mut registry));
     let access_control_metrics = Arc::new(AccessControlMetrics::register(&mut registry));
     let collab_metrics = Arc::new(CollabMetrics::register(&mut registry));
+    let published_collab_metrics = Arc::new(PublishedCollabMetrics::register(&mut registry));
+    let appflowy_web_metrics = Arc::new(AppFlowyWebMetrics::register(&mut registry));
+    let embedding_metrics = Arc::new(EmbeddingMetrics::register(&mut registry));
+    let collab_stream_metrics = Arc::new(CollabStreamMetrics::register(&mut registry));
+    let ai_metrics = Arc::new(AIMetrics::register(&mut registry));
     Self {
       registry: Arc::new(registry),
       request_metrics,
       realtime_metrics,
       access_control_metrics,
       collab_metrics,
+      published_collab_metrics,
+      appflowy_web_metrics,
+      embedding_metrics,
+      collab_stream_metrics,
+      ai_metrics,
     }
   }
 }
 
 #[derive(Debug, Clone)]
 pub struct GoTrueAdmin {
-  pub admin_email: String,
-  pub password: Secret<String>,
+  pub gotrue_client: gotrue::api::Client,
+  pub jwt_secret: Secret<String>,
+  pub service_role: String,
 }
 
 impl GoTrueAdmin {
-  pub fn new(admin_email: String, password: String) -> Self {
+  pub fn new(jwt_secret: String, service_role: String, gotrue_client: gotrue::api::Client) -> Self {
     Self {
-      admin_email,
-      password: password.into(),
+      jwt_secret: jwt_secret.into(),
+      gotrue_client,
+      service_role,
     }
   }
 
-  pub async fn token(&self, client: &gotrue::api::Client) -> Result<String, AppError> {
-    let token = client
-      .token(&Grant::Password(PasswordGrant {
-        email: self.admin_email.clone(),
-        password: self.password.expose_secret().clone(),
-      }))
-      .await?;
-    Ok(token.access_token)
+  pub async fn token(&self) -> Result<String, AppError> {
+    let claims = GoTrueServiceRoleClaims {
+      role: self.service_role.clone(),
+    };
+    claims
+      .encode(self.jwt_secret.expose_secret().as_bytes())
+      .map_err(|err| AppError::Internal(anyhow!(err.to_string())))
   }
 }

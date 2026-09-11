@@ -1,50 +1,53 @@
 use crate::notify::{ClientToken, TokenStateReceiver};
-use gotrue_entity::dto::AuthProvider;
-use shared_entity::dto::workspace_dto::{
-  CreateWorkspaceParam, PatchWorkspaceParam, WorkspaceMemberInvitation,
-};
+use app_error::AppError;
+use app_error::ErrorCode;
+use client_api_entity::auth_dto::DeleteUserQuery;
+use client_api_entity::server_info_dto::ServerInfoResponseItem;
+use client_api_entity::workspace_dto::FavoriteSectionItems;
+use client_api_entity::workspace_dto::RecentSectionItems;
+use client_api_entity::workspace_dto::TrashSectionItems;
+use client_api_entity::workspace_dto::{FolderView, QueryWorkspaceFolder, QueryWorkspaceParam};
+use client_api_entity::AuthProvider;
+use client_api_entity::GetInvitationCodeInfoQuery;
+use client_api_entity::InvitationCodeInfo;
+use client_api_entity::InvitedWorkspace;
+use client_api_entity::JoinWorkspaceByInviteCodeParams;
+use client_api_entity::WorkspaceInviteCodeParams;
+use client_api_entity::WorkspaceInviteToken as WorkspaceInviteCode;
+use gotrue::grant::PasswordGrant;
+use gotrue::grant::{Grant, RefreshTokenGrant};
+use gotrue::params::{AdminUserParams, GenerateLinkParams};
+use gotrue::params::{MagicLinkParams, VerifyParams, VerifyType};
+use reqwest::StatusCode;
+use shared_entity::dto::workspace_dto::{CreateWorkspaceParam, PatchWorkspaceParam};
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 #[cfg(feature = "enable_brotli")]
 use std::io::Read;
 
-use app_error::AppError;
-use bytes::Bytes;
-use collab_entity::CollabType;
-use database_entity::dto::{
-  AFCollabMember, AFCollabMembers, AFSnapshotMeta, AFSnapshotMetas, AFUserProfile,
-  AFUserWorkspaceInfo, AFWorkspace, AFWorkspaceInvitation, AFWorkspaceInvitationStatus,
-  AFWorkspaceMember, AFWorkspaces, BatchQueryCollabParams, BatchQueryCollabResult,
-  CollabMemberIdentify, CreateCollabParams, DeleteCollabParams, InsertCollabMemberParams,
-  QueryCollab, QueryCollabMembers, QuerySnapshotParams, SnapshotData, UpdateCollabMemberParams,
-};
-use futures_util::StreamExt;
-use gotrue::grant::PasswordGrant;
-use gotrue::grant::{Grant, RefreshTokenGrant};
-use gotrue::params::MagicLinkParams;
-use gotrue::params::{AdminUserParams, GenerateLinkParams};
-use mime::Mime;
 use parking_lot::RwLock;
 use reqwest::Method;
 use reqwest::RequestBuilder;
-use reqwest::{header, StatusCode};
+
+use crate::retry::{RefreshTokenAction, RefreshTokenRetryCondition};
+use crate::ws::ConnectInfo;
+use anyhow::anyhow;
+use client_api_entity::SignUpResponse::{Authenticated, NotAuthenticated};
+use client_api_entity::{AFUserProfile, AFUserWorkspaceInfo, AFWorkspace};
+use client_api_entity::{GotrueTokenResponse, UpdateGotrueUserParams, User};
 use semver::Version;
-use shared_entity::dto::auth_dto::SignInTokenResponse;
 use shared_entity::dto::auth_dto::UpdateUserParams;
-use shared_entity::dto::workspace_dto::{
-  BlobMetadata, CreateWorkspaceMembers, RepeatedBlobMetaData, WorkspaceMemberChangeset,
-  WorkspaceMembers, WorkspaceSpaceUsage,
-};
+use shared_entity::dto::auth_dto::{SignInPasswordResponse, SignInTokenResponse};
+use shared_entity::dto::workspace_dto::WorkspaceSpaceUsage;
 use shared_entity::response::{AppResponse, AppResponseError};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, event, info, instrument, trace, warn};
+use tokio_retry::strategy::FixedInterval;
+use tokio_retry::RetryIf;
+use tracing::{debug, error, event, info, instrument, trace, warn};
 use url::Url;
-
-use crate::ws::ConnectInfo;
-use gotrue_entity::dto::SignUpResponse::{Authenticated, NotAuthenticated};
-use gotrue_entity::dto::{GotrueTokenResponse, UpdateGotrueUserParams, User};
-use shared_entity::dto::ai_dto::{SummarizeRowParams, SummarizeRowResponse};
+use uuid::Uuid;
 
 pub const X_COMPRESSION_TYPE: &str = "X-Compression-Type";
 pub const X_COMPRESSION_BUFFER_SIZE: &str = "X-Compression-Buffer-Size";
@@ -101,7 +104,7 @@ impl Default for ClientConfiguration {
 ///
 #[derive(Clone)]
 pub struct Client {
-  pub(crate) cloud_client: reqwest::Client,
+  pub cloud_client: reqwest::Client,
   pub(crate) gotrue_client: gotrue::api::Client,
   pub base_url: String,
   pub ws_addr: String,
@@ -111,6 +114,7 @@ pub struct Client {
   pub(crate) is_refreshing_token: Arc<AtomicBool>,
   pub(crate) refresh_ret_txs: Arc<RwLock<Vec<RefreshTokenSender>>>,
   pub(crate) config: ClientConfiguration,
+  pub(crate) ai_model: Arc<RwLock<String>>,
 }
 
 pub(crate) type RefreshTokenSender = tokio::sync::oneshot::Sender<Result<(), AppResponseError>>;
@@ -134,8 +138,26 @@ impl Client {
     client_id: &str,
   ) -> Self {
     let reqwest_client = reqwest::Client::new();
-    let client_version = Version::parse(client_id).unwrap_or_else(|_| Version::new(0, 5, 0));
+    let client_version = Version::parse(client_id).unwrap_or_else(|_| Version::new(0, 6, 7));
 
+    let min_version = Version::new(0, 6, 7);
+    let max_version = Version::new(1, 0, 0);
+    // Log warnings in debug mode if the version is out of the valid range
+    if cfg!(debug_assertions) {
+      if client_version < min_version {
+        error!(
+          "Client version is less than {}, setting it to {}",
+          min_version, min_version
+        );
+      } else if client_version >= max_version {
+        error!(
+          "Client version is greater than or equal to {}, setting it to {}",
+          max_version, min_version
+        );
+      }
+    }
+
+    let client_version = client_version.clamp(min_version, max_version);
     #[cfg(debug_assertions)]
     {
       let feature_flags = [
@@ -156,6 +178,8 @@ impl Client {
       );
     }
 
+    let ai_model = Arc::new(RwLock::new("Auto".to_string()));
+
     Self {
       base_url: base_url.to_string(),
       ws_addr: ws_addr.to_string(),
@@ -167,6 +191,7 @@ impl Client {
       config,
       device_id: device_id.to_string(),
       client_version,
+      ai_model,
     }
   }
 
@@ -180,6 +205,11 @@ impl Client {
 
   pub fn gotrue_url(&self) -> &str {
     &self.gotrue_client.base_url
+  }
+
+  pub fn set_ai_model(&self, model: String) {
+    info!("using ai model: {:?}", model);
+    *self.ai_model.write() = model;
   }
 
   #[instrument(level = "debug", skip_all, err)]
@@ -203,7 +233,7 @@ impl Client {
   /// string representation of the access token. If the lock cannot be acquired or
   /// the token is not present, an error is returned.
   #[instrument(level = "debug", skip_all, err)]
-  pub fn get_token(&self) -> Result<String, AppResponseError> {
+  pub fn get_token_str(&self) -> Result<String, AppResponseError> {
     let token_str = self
       .token
       .read()
@@ -212,8 +242,47 @@ impl Client {
     Ok(token_str)
   }
 
+  #[instrument(level = "debug", skip_all, err)]
+  pub fn get_token(&self) -> Result<GotrueTokenResponse, AppResponseError> {
+    let guard = self.token.read();
+    let resp = guard
+      .as_ref()
+      .ok_or_else(|| AppResponseError::new(ErrorCode::UserUnAuthorized, "user is not logged in"))?;
+    Ok(resp.clone())
+  }
+
+  pub fn get_access_token(&self) -> Result<String, AppResponseError> {
+    self
+      .token
+      .read()
+      .as_ref()
+      .map(|v| v.access_token.clone())
+      .ok_or_else(|| AppResponseError::new(ErrorCode::UserUnAuthorized, "user is not logged in"))
+  }
+
   pub fn subscribe_token_state(&self) -> TokenStateReceiver {
     self.token.read().subscribe()
+  }
+
+  #[instrument(skip_all, err)]
+  pub async fn sign_in_password(
+    &self,
+    email: &str,
+    password: &str,
+  ) -> Result<SignInPasswordResponse, AppResponseError> {
+    let response = self
+      .gotrue_client
+      .token(&Grant::Password(PasswordGrant {
+        email: email.to_owned(),
+        password: password.to_owned(),
+      }))
+      .await?;
+    let is_new = self.verify_token_cloud(&response.access_token).await?;
+    self.token.write().set(response.clone());
+    Ok(SignInPasswordResponse {
+      gotrue_response: response,
+      is_new,
+    })
   }
 
   /// Sign in with magic link
@@ -242,6 +311,52 @@ impl Client {
     Ok(())
   }
 
+  /// Sign in with recovery token
+  ///
+  /// User will receive an email with a recovery code to sign in after clicking Forget Password.
+  #[instrument(level = "debug", skip_all, err)]
+  pub async fn sign_in_with_recovery_code(
+    &self,
+    email: &str,
+    passcode: &str,
+  ) -> Result<GotrueTokenResponse, AppResponseError> {
+    let response = self
+      .gotrue_client
+      .verify(&VerifyParams {
+        email: email.to_owned(),
+        token: passcode.to_owned(),
+        type_: VerifyType::Recovery,
+      })
+      .await?;
+    let _ = self.verify_token_cloud(&response.access_token).await?;
+    self.token.write().set(response.clone());
+    Ok(response)
+  }
+
+  /// Sign in with passcode (OTP)
+  ///
+  /// User will receive an email with a passcode to sign in.
+  ///
+  /// For more information, please refer to the sign_in_with_magic_link function.
+  #[instrument(level = "debug", skip_all, err)]
+  pub async fn sign_in_with_passcode(
+    &self,
+    email: &str,
+    passcode: &str,
+  ) -> Result<GotrueTokenResponse, AppResponseError> {
+    let response = self
+      .gotrue_client
+      .verify(&VerifyParams {
+        email: email.to_owned(),
+        token: passcode.to_owned(),
+        type_: VerifyType::MagicLink,
+      })
+      .await?;
+    let _ = self.verify_token_cloud(&response.access_token).await?;
+    self.token.write().set(response.clone());
+    Ok(response)
+  }
+
   /// Attempts to sign in using a URL, extracting refresh_token from the URL.
   /// It looks like, e.g., `appflowy-flutter://#access_token=...&expires_in=3600&provider_token=...&refresh_token=...&token_type=bearer`.
   ///
@@ -255,13 +370,18 @@ impl Client {
       .split('&');
 
     let mut refresh_token: Option<&str> = None;
+    let mut provider_token: Option<String> = None;
+    let mut provider_refresh_token: Option<String> = None;
     for param in key_value_pairs {
       match param.split_once('=') {
         Some(pair) => {
           let (k, v) = pair;
           if k == "refresh_token" {
             refresh_token = Some(v);
-            break;
+          } else if k == "provider_token" {
+            provider_token = Some(v.to_string());
+          } else if k == "provider_refresh_token" {
+            provider_refresh_token = Some(v.to_string());
           }
         },
         None => warn!("param is not in key=value format: {}", param),
@@ -269,12 +389,17 @@ impl Client {
     }
     let refresh_token = refresh_token.ok_or(url_missing_param("refresh_token"))?;
 
-    let new_token = self
+    let mut new_token = self
       .gotrue_client
       .token(&Grant::RefreshToken(RefreshTokenGrant {
         refresh_token: refresh_token.to_owned(),
       }))
       .await?;
+
+    // refresh endpoint does not return provider token
+    // so we need to set it manually to preserve this information
+    new_token.provider_access_token = provider_token;
+    new_token.provider_refresh_token = provider_refresh_token;
 
     let (_user, new) = self.verify_token(&new_token.access_token).await?;
     self.token.write().set(new_token);
@@ -282,6 +407,17 @@ impl Client {
   }
 
   /// Returns an OAuth URL by constructing the authorization URL for the specified provider.
+  #[instrument(level = "debug", skip_all, err)]
+  pub async fn generate_oauth_url_with_provider(
+    &self,
+    provider: &AuthProvider,
+  ) -> Result<String, AppResponseError> {
+    self
+      .generate_url_with_provider_and_redirect_to(provider, None)
+      .await
+  }
+
+  /// Returns an OAuth URL by constructing the authorization URL for the specified provider and redirecting to the specified URL.
   ///
   /// This asynchronous function communicates with the GoTrue client to retrieve settings and
   /// validate the availability of the specified OAuth provider. If the provider is available,
@@ -292,19 +428,19 @@ impl Client {
   /// For example, the OAuth URL on Google looks like `https://appflowy.io/authorize?provider=google`.
   /// The deep link looks like `appflowy-flutter://#access_token=...&expires_in=3600&provider_token=...&refresh_token=...&token_type=bearer`.
   ///
-  /// The appflowy-flutter:// is a hardcoded schema in the frontend application
   ///
   /// # Parameters
   /// - `provider`: A reference to an `OAuthProvider` indicating which OAuth provider to use for login.
+  /// - `redirect_to`: An optional `String` containing the URL to redirect to after the user is authenticated.
   ///
   /// # Returns
   /// - `Ok(String)`: A `String` containing the constructed authorization URL if the specified provider is available.
   /// - `Err(AppResponseError)`: An `AppResponseError` indicating either the OAuth provider is invalid or other issues occurred while fetching settings.
   ///
-  #[instrument(level = "debug", skip_all, err)]
-  pub async fn generate_oauth_url_with_provider(
+  pub async fn generate_url_with_provider_and_redirect_to(
     &self,
     provider: &AuthProvider,
+    redirect_to: Option<String>,
   ) -> Result<String, AppResponseError> {
     let settings = self.gotrue_client.settings().await?;
     if !settings.external.has_provider(provider) {
@@ -317,7 +453,12 @@ impl Client {
     url
       .query_pairs_mut()
       .append_pair("provider", provider.as_str())
-      .append_pair("redirect_to", DESKTOP_CALLBACK_URL);
+      .append_pair(
+        "redirect_to",
+        redirect_to
+          .unwrap_or_else(|| DESKTOP_CALLBACK_URL.to_string())
+          .as_str(),
+      );
 
     if let AuthProvider::Google = provider {
       url
@@ -398,7 +539,8 @@ impl Client {
   async fn verify_token_cloud(&self, access_token: &str) -> Result<bool, AppResponseError> {
     let url = format!("{}/api/user/verify/{}", self.base_url, access_token);
     let resp = self.cloud_client.get(&url).send().await?;
-    let sign_in_resp: SignInTokenResponse = AppResponse::from_response(resp).await?.into_data()?;
+    let sign_in_resp: SignInTokenResponse =
+      process_response_data::<SignInTokenResponse>(resp).await?;
     Ok(sign_in_resp.is_new)
   }
 
@@ -472,7 +614,6 @@ impl Client {
   }
 
   /// Only expose this method for testing
-  #[cfg(debug_assertions)]
   pub fn token(&self) -> Arc<RwLock<ClientToken>> {
     self.token.clone()
   }
@@ -536,10 +677,7 @@ impl Client {
       .await?
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<AFUserProfile>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<AFUserProfile>(resp).await
   }
 
   #[instrument(level = "info", skip_all, err)]
@@ -550,23 +688,18 @@ impl Client {
       .await?
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<AFUserWorkspaceInfo>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<AFUserWorkspaceInfo>(resp).await
   }
 
   #[instrument(level = "info", skip_all, err)]
-  pub async fn delete_workspace(&self, workspace_id: &str) -> Result<(), AppResponseError> {
+  pub async fn delete_workspace(&self, workspace_id: &Uuid) -> Result<(), AppResponseError> {
     let url = format!("{}/api/workspace/{}", self.base_url, workspace_id);
     let resp = self
       .http_client_with_auth(Method::DELETE, &url)
       .await?
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()?;
-    Ok(())
+    process_response_error(resp).await
   }
 
   #[instrument(level = "info", skip_all, err)]
@@ -581,10 +714,7 @@ impl Client {
       .json(&params)
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<AFWorkspace>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<AFWorkspace>(resp).await
   }
 
   #[instrument(level = "info", skip_all, err)]
@@ -596,219 +726,202 @@ impl Client {
       .json(&params)
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()
+    process_response_error(resp).await
+  }
+
+  pub async fn get_workspaces(&self) -> Result<Vec<AFWorkspace>, AppResponseError> {
+    self
+      .get_workspaces_opt(QueryWorkspaceParam::default())
+      .await
   }
 
   #[instrument(level = "info", skip_all, err)]
-  pub async fn get_workspaces(&self) -> Result<AFWorkspaces, AppResponseError> {
+  pub async fn get_workspaces_opt(
+    &self,
+    param: QueryWorkspaceParam,
+  ) -> Result<Vec<AFWorkspace>, AppResponseError> {
     let url = format!("{}/api/workspace", self.base_url);
     let resp = self
       .http_client_with_auth(Method::GET, &url)
       .await?
+      .query(&param)
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<AFWorkspaces>::from_response(resp)
+    process_response_data::<Vec<AFWorkspace>>(resp).await
+  }
+
+  /// List out the views in the workspace recursively.
+  /// The depth parameter specifies the depth of the folder view tree to return(default: 1).
+  /// e.g., depth=1 will return only up to `Shared` and `PrivateSpace`
+  /// depth=2 will return up to `mydoc1`, `mydoc2`, `mydoc3`, `mydoc4`
+  ///
+  /// . MyWorkspace
+  /// ├── Shared
+  /// │   ├── mydoc1
+  /// │   └── mydoc2
+  /// └── PrivateSpace
+  ///     ├── mydoc3
+  ///     └── mydoc4
+  #[instrument(level = "info", skip_all, err)]
+  pub async fn get_workspace_folder(
+    &self,
+    workspace_id: &Uuid,
+    depth: Option<u32>,
+    root_view_id: Option<Uuid>,
+  ) -> Result<FolderView, AppResponseError> {
+    let url = format!("{}/api/workspace/{}/folder", self.base_url, workspace_id);
+    let resp = self
+      .http_client_with_auth(Method::GET, &url)
       .await?
-      .into_data()
+      .query(&QueryWorkspaceFolder {
+        depth,
+        root_view_id,
+      })
+      .send()
+      .await?;
+    process_response_data::<FolderView>(resp).await
   }
 
   #[instrument(level = "info", skip_all, err)]
-  pub async fn open_workspace(&self, workspace_id: &str) -> Result<AFWorkspace, AppResponseError> {
+  pub async fn open_workspace(&self, workspace_id: &Uuid) -> Result<AFWorkspace, AppResponseError> {
     let url = format!("{}/api/workspace/{}/open", self.base_url, workspace_id);
     let resp = self
       .http_client_with_auth(Method::PUT, &url)
       .await?
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<AFWorkspace>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<AFWorkspace>(resp).await
   }
 
   #[instrument(level = "info", skip_all, err)]
-  pub async fn leave_workspace(&self, workspace_id: &str) -> Result<(), AppResponseError> {
-    let url = format!("{}/api/workspace/{}/leave", self.base_url, workspace_id);
+  pub async fn get_workspace_favorite(
+    &self,
+    workspace_id: &Uuid,
+  ) -> Result<FavoriteSectionItems, AppResponseError> {
+    let url = format!("{}/api/workspace/{}/favorite", self.base_url, workspace_id);
+    let resp = self
+      .http_client_with_auth(Method::GET, &url)
+      .await?
+      .send()
+      .await?;
+    process_response_data::<FavoriteSectionItems>(resp).await
+  }
+
+  #[instrument(level = "info", skip_all, err)]
+  pub async fn get_workspace_recent(
+    &self,
+    workspace_id: &Uuid,
+  ) -> Result<RecentSectionItems, AppResponseError> {
+    let url = format!("{}/api/workspace/{}/recent", self.base_url, workspace_id);
+    let resp = self
+      .http_client_with_auth(Method::GET, &url)
+      .await?
+      .send()
+      .await?;
+    process_response_data::<RecentSectionItems>(resp).await
+  }
+
+  #[instrument(level = "info", skip_all, err)]
+  pub async fn get_workspace_trash(
+    &self,
+    workspace_id: &Uuid,
+  ) -> Result<TrashSectionItems, AppResponseError> {
+    let url = format!("{}/api/workspace/{}/trash", self.base_url, workspace_id);
+    let resp = self
+      .http_client_with_auth(Method::GET, &url)
+      .await?
+      .send()
+      .await?;
+    process_response_data::<TrashSectionItems>(resp).await
+  }
+
+  pub async fn join_workspace_by_invitation_code(
+    &self,
+    invitation_code: &str,
+  ) -> Result<InvitedWorkspace, AppResponseError> {
+    let url = format!("{}/api/workspace/join-by-invite-code", self.base_url);
     let resp = self
       .http_client_with_auth(Method::POST, &url)
       .await?
-      .json(&())
+      .json(&JoinWorkspaceByInviteCodeParams {
+        code: invitation_code.to_string(),
+      })
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()
+    process_response_data::<InvitedWorkspace>(resp).await
   }
 
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn get_workspace_members<W: AsRef<str>>(
+  pub async fn get_invitation_code_info(
     &self,
-    workspace_id: W,
-  ) -> Result<Vec<AFWorkspaceMember>, AppResponseError> {
+    invitation_code: &str,
+  ) -> Result<InvitationCodeInfo, AppResponseError> {
+    let url = format!("{}/api/invite-code-info", self.base_url);
+    let resp = self
+      .http_client_with_auth(Method::GET, &url)
+      .await?
+      .query(&GetInvitationCodeInfoQuery {
+        code: invitation_code.to_string(),
+      })
+      .send()
+      .await?;
+    process_response_data::<InvitationCodeInfo>(resp).await
+  }
+
+  pub async fn create_workspace_invitation_code(
+    &self,
+    workspace_id: &Uuid,
+    params: &WorkspaceInviteCodeParams,
+  ) -> Result<WorkspaceInviteCode, AppResponseError> {
     let url = format!(
-      "{}/api/workspace/{}/member",
-      self.base_url,
-      workspace_id.as_ref()
+      "{}/api/workspace/{}/invite-code",
+      self.base_url, workspace_id
+    );
+    let resp = self
+      .http_client_with_auth(Method::POST, &url)
+      .await?
+      .json(params)
+      .send()
+      .await?;
+    process_response_data::<WorkspaceInviteCode>(resp).await
+  }
+
+  pub async fn get_workspace_invitation_code(
+    &self,
+    workspace_id: &Uuid,
+  ) -> Result<WorkspaceInviteCode, AppResponseError> {
+    let url = format!(
+      "{}/api/workspace/{}/invite-code",
+      self.base_url, workspace_id
     );
     let resp = self
       .http_client_with_auth(Method::GET, &url)
       .await?
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<Vec<AFWorkspaceMember>>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<WorkspaceInviteCode>(resp).await
   }
 
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn invite_workspace_members(
+  pub async fn delete_workspace_invitation_code(
     &self,
-    workspace_id: &str,
-    invitations: Vec<WorkspaceMemberInvitation>,
-  ) -> Result<(), AppResponseError> {
-    let url = format!("{}/api/workspace/{}/invite", self.base_url, workspace_id);
-    let resp = self
-      .http_client_with_auth(Method::POST, &url)
-      .await?
-      .json(&invitations)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()?;
-    Ok(())
-  }
-
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn list_workspace_invitations(
-    &self,
-    status: Option<AFWorkspaceInvitationStatus>,
-  ) -> Result<Vec<AFWorkspaceInvitation>, AppResponseError> {
-    let url = format!("{}/api/workspace/invite", self.base_url);
-    let mut builder = self.http_client_with_auth(Method::GET, &url).await?;
-    if let Some(status) = status {
-      builder = builder.query(&[("status", status)])
-    }
-    let resp = builder.send().await?;
-    log_request_id(&resp);
-    let res = AppResponse::<Vec<AFWorkspaceInvitation>>::from_response(resp).await?;
-    res.into_data()
-  }
-
-  pub async fn accept_workspace_invitation(
-    &self,
-    invitation_id: &str,
+    workspace_id: &Uuid,
   ) -> Result<(), AppResponseError> {
     let url = format!(
-      "{}/api/workspace/accept-invite/{}",
-      self.base_url, invitation_id
+      "{}/api/workspace/{}/invite-code",
+      self.base_url, workspace_id
     );
-    let resp = self
-      .http_client_with_auth(Method::POST, &url)
-      .await?
-      .json(&())
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()?;
-    Ok(())
-  }
-
-  #[deprecated(note = "use invite_workspace_members instead")]
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn add_workspace_members<T: Into<CreateWorkspaceMembers>, W: AsRef<str>>(
-    &self,
-    workspace_id: W,
-    members: T,
-  ) -> Result<(), AppResponseError> {
-    let members = members.into();
-    let url = format!(
-      "{}/api/workspace/{}/member",
-      self.base_url,
-      workspace_id.as_ref()
-    );
-    let resp = self
-      .http_client_with_auth(Method::POST, &url)
-      .await?
-      .json(&members)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()?;
-    Ok(())
-  }
-
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn update_workspace_member<T: AsRef<str>>(
-    &self,
-    workspace_id: T,
-    changeset: WorkspaceMemberChangeset,
-  ) -> Result<(), AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/member",
-      self.base_url,
-      workspace_id.as_ref()
-    );
-    let resp = self
-      .http_client_with_auth(Method::PUT, &url)
-      .await?
-      .json(&changeset)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()?;
-    Ok(())
-  }
-
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn remove_workspace_members<T: AsRef<str>>(
-    &self,
-    workspace_id: T,
-    member_emails: Vec<String>,
-  ) -> Result<(), AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/member",
-      self.base_url,
-      workspace_id.as_ref()
-    );
-    let payload = WorkspaceMembers::from(member_emails);
     let resp = self
       .http_client_with_auth(Method::DELETE, &url)
       .await?
-      .json(&payload)
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()?;
-    Ok(())
-  }
-
-  #[instrument(skip_all, err)]
-  pub async fn sign_in_password(
-    &self,
-    email: &str,
-    password: &str,
-  ) -> Result<bool, AppResponseError> {
-    let access_token_resp = self
-      .gotrue_client
-      .token(&Grant::Password(PasswordGrant {
-        email: email.to_owned(),
-        password: password.to_owned(),
-      }))
-      .await?;
-    let is_new = self
-      .verify_token_cloud(&access_token_resp.access_token)
-      .await?;
-    self.token.write().set(access_token_resp);
-    Ok(is_new)
+    process_response_error(resp).await
   }
 
   #[instrument(level = "info", skip_all, err)]
   pub async fn sign_up(&self, email: &str, password: &str) -> Result<(), AppResponseError> {
     match self.gotrue_client.sign_up(email, password, None).await? {
       Authenticated(access_token_resp) => {
-        self.token.write().set(access_token_resp);
+        self.token.write().set(access_token_resp.clone());
         Ok(())
       },
       NotAuthenticated(user) => {
@@ -847,258 +960,37 @@ impl Client {
       .json(&params)
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()
+    process_response_error(resp).await
   }
 
   #[instrument(level = "info", skip_all, err)]
-  pub async fn create_collab(&self, params: CreateCollabParams) -> Result<(), AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/collab/{}",
-      self.base_url, params.workspace_id, &params.object_id
-    );
-    let bytes = params
-      .to_bytes()
-      .map_err(|err| AppError::Internal(err.into()))?;
+  pub async fn delete_user(&self) -> Result<(), AppResponseError> {
+    let (provider_access_token, provider_refresh_token) = {
+      let token = &self.token;
+      let token_read = token.read();
+      let token_resp = token_read
+        .as_ref()
+        .ok_or(AppResponseError::from(AppError::NotLoggedIn(
+          "token is empty".to_string(),
+        )))?;
+      (
+        token_resp.provider_access_token.clone(),
+        token_resp.provider_refresh_token.clone(),
+      )
+    };
 
-    let compress_bytes = spawn_blocking_brotli_compress(
-      bytes,
-      self.config.compression_quality,
-      self.config.compression_buffer_size,
-    )
-    .await?;
-
-    #[allow(unused_mut)]
-    let mut builder = self
-      .http_client_with_auth_compress(Method::POST, &url)
-      .await?;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-      builder = builder.timeout(Duration::from_secs(60));
-    }
-
-    let resp = builder.body(compress_bytes).send().await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()
-  }
-
-  pub async fn get_snapshot_list(
-    &self,
-    workspace_id: &str,
-    object_id: &str,
-  ) -> Result<AFSnapshotMetas, AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/{}/snapshot/list",
-      self.base_url, workspace_id, object_id
-    );
-    let resp = self
-      .http_client_with_auth(Method::GET, &url)
-      .await?
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<AFSnapshotMetas>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  pub async fn get_snapshot(
-    &self,
-    workspace_id: &str,
-    object_id: &str,
-    params: QuerySnapshotParams,
-  ) -> Result<SnapshotData, AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/{}/snapshot",
-      self.base_url, workspace_id, object_id,
-    );
-    let resp = self
-      .http_client_with_auth(Method::GET, &url)
-      .await?
-      .json(&params)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<SnapshotData>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  pub async fn create_snapshot(
-    &self,
-    workspace_id: &str,
-    object_id: &str,
-    collab_type: CollabType,
-  ) -> Result<AFSnapshotMeta, AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/{}/snapshot",
-      self.base_url, workspace_id, object_id,
-    );
-    let resp = self
-      .http_client_with_auth(Method::POST, &url)
-      .await?
-      .json(&collab_type)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<AFSnapshotMeta>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn update_collab(&self, params: CreateCollabParams) -> Result<(), AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/collab/{}",
-      self.base_url, &params.workspace_id, &params.object_id
-    );
-    let resp = self
-      .http_client_with_auth(Method::PUT, &url)
-      .await?
-      .json(&params)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()
-  }
-
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn batch_get_collab(
-    &self,
-    workspace_id: &str,
-    params: Vec<QueryCollab>,
-  ) -> Result<BatchQueryCollabResult, AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/collab_list",
-      self.base_url, workspace_id
-    );
-    let params = BatchQueryCollabParams(params);
-    let resp = self
-      .http_client_with_auth(Method::GET, &url)
-      .await?
-      .json(&params)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<BatchQueryCollabResult>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn delete_collab(&self, params: DeleteCollabParams) -> Result<(), AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/collab/{}",
-      self.base_url, &params.workspace_id, &params.object_id
-    );
+    let url = format!("{}/api/user", self.base_url);
     let resp = self
       .http_client_with_auth(Method::DELETE, &url)
       .await?
-      .json(&params)
+      .query(&DeleteUserQuery {
+        provider_access_token,
+        provider_refresh_token,
+      })
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()
-  }
 
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn add_collab_member(
-    &self,
-    params: InsertCollabMemberParams,
-  ) -> Result<(), AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/collab/{}/member",
-      self.base_url, params.workspace_id, &params.object_id
-    );
-    let resp = self
-      .http_client_with_auth(Method::POST, &url)
-      .await?
-      .json(&params)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()
-  }
-
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn get_collab_member(
-    &self,
-    params: CollabMemberIdentify,
-  ) -> Result<AFCollabMember, AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/collab/{}/member",
-      self.base_url, params.workspace_id, &params.object_id
-    );
-    let resp = self
-      .http_client_with_auth(Method::GET, &url)
-      .await?
-      .json(&params)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<AFCollabMember>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn update_collab_member(
-    &self,
-    params: UpdateCollabMemberParams,
-  ) -> Result<(), AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/collab/{}/member",
-      self.base_url, params.workspace_id, &params.object_id
-    );
-    let resp = self
-      .http_client_with_auth(Method::PUT, &url)
-      .await?
-      .json(&params)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()
-  }
-
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn remove_collab_member(
-    &self,
-    params: CollabMemberIdentify,
-  ) -> Result<(), AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/collab/{}/member",
-      self.base_url, params.workspace_id, &params.object_id
-    );
-    let resp = self
-      .http_client_with_auth(Method::DELETE, &url)
-      .await?
-      .json(&params)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()
-  }
-
-  #[instrument(level = "info", skip_all, err)]
-  pub async fn get_collab_members(
-    &self,
-    params: QueryCollabMembers,
-  ) -> Result<AFCollabMembers, AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/collab/{}/member/list",
-      self.base_url, params.workspace_id, &params.object_id
-    );
-    let resp = self
-      .http_client_with_auth(Method::GET, &url)
-      .await?
-      .json(&params)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<AFCollabMembers>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_error(resp).await
   }
 
   pub async fn ws_connect_info(&self, auto_refresh: bool) -> Result<ConnectInfo, AppResponseError> {
@@ -1118,141 +1010,10 @@ impl Client {
     })
   }
 
-  pub fn get_blob_url(&self, workspace_id: &str, file_id: &str) -> String {
-    format!(
-      "{}/api/file_storage/{}/blob/{}",
-      self.base_url, workspace_id, file_id
-    )
-  }
-
-  #[instrument(level = "info", skip_all)]
-  pub async fn put_blob<T: Into<Bytes>>(
-    &self,
-    url: &str,
-    data: T,
-    mime: &Mime,
-  ) -> Result<(), AppResponseError> {
-    let data = data.into();
-    let resp = self
-      .http_client_with_auth(Method::PUT, url)
-      .await?
-      .header(header::CONTENT_TYPE, mime.to_string())
-      .body(data)
-      .send()
-      .await?;
-    log_request_id(&resp);
-    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
-      return Err(AppResponseError::from(AppError::PayloadTooLarge(
-        StatusCode::PAYLOAD_TOO_LARGE.to_string(),
-      )));
-    }
-    AppResponse::<()>::from_response(resp).await?.into_error()
-  }
-
-  /// Only expose this method for testing
-  #[instrument(level = "info", skip_all)]
-  #[cfg(debug_assertions)]
-  pub async fn put_blob_with_content_length<T: Into<Bytes>>(
-    &self,
-    url: &str,
-    data: T,
-    mime: &Mime,
-    content_length: usize,
-  ) -> Result<crate::entity::AFBlobRecord, AppResponseError> {
-    let resp = self
-      .http_client_with_auth(Method::PUT, url)
-      .await?
-      .header(header::CONTENT_TYPE, mime.to_string())
-      .header(header::CONTENT_LENGTH, content_length)
-      .body(data.into())
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<crate::entity::AFBlobRecord>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  /// Get the file with the given url. The url should be in the format of
-  /// `https://appflowy.io/api/file_storage/<workspace_id>/<file_id>`.
-  #[instrument(level = "info", skip_all)]
-  pub async fn get_blob(&self, url: &str) -> Result<(Mime, Vec<u8>), AppResponseError> {
-    let resp = self
-      .http_client_with_auth(Method::GET, url)
-      .await?
-      .send()
-      .await?;
-    log_request_id(&resp);
-
-    match resp.status() {
-      reqwest::StatusCode::OK => {
-        // get mime from resp header
-        let mime = {
-          match resp.headers().get(header::CONTENT_TYPE) {
-            Some(v) => match v.to_str() {
-              Ok(v) => match v.parse::<Mime>() {
-                Ok(v) => v,
-                Err(e) => {
-                  tracing::error!("failed to parse mime from header: {:?}", e);
-                  mime::TEXT_PLAIN
-                },
-              },
-              Err(e) => {
-                tracing::error!("failed to get mime from header: {:?}", e);
-                mime::TEXT_PLAIN
-              },
-            },
-            None => mime::TEXT_PLAIN,
-          }
-        };
-
-        let mut stream = resp.bytes_stream();
-        let mut acc: Vec<u8> = Vec::new();
-        while let Some(raw_bytes) = stream.next().await {
-          acc.extend_from_slice(&raw_bytes?);
-        }
-        Ok((mime, acc))
-      },
-      reqwest::StatusCode::NOT_FOUND => Err(AppResponseError::from(AppError::RecordNotFound(
-        url.to_owned(),
-      ))),
-      c => Err(AppResponseError::from(AppError::Unhandled(format!(
-        "status code: {}, message: {}",
-        c,
-        resp.text().await?
-      )))),
-    }
-  }
-
-  #[instrument(level = "info", skip_all)]
-  pub async fn get_blob_metadata(&self, url: &str) -> Result<BlobMetadata, AppResponseError> {
-    let resp = self
-      .http_client_with_auth(Method::GET, url)
-      .await?
-      .send()
-      .await?;
-
-    log_request_id(&resp);
-    AppResponse::<BlobMetadata>::from_response(resp)
-      .await?
-      .into_data()
-  }
-
-  #[instrument(level = "info", skip_all)]
-  pub async fn delete_blob(&self, url: &str) -> Result<(), AppResponseError> {
-    let resp = self
-      .http_client_with_auth(Method::DELETE, url)
-      .await?
-      .send()
-      .await?;
-    log_request_id(&resp);
-    AppResponse::<()>::from_response(resp).await?.into_error()
-  }
-
   #[instrument(level = "info", skip_all)]
   pub async fn get_workspace_usage(
     &self,
-    workspace_id: &str,
+    workspace_id: &Uuid,
   ) -> Result<WorkspaceSpaceUsage, AppResponseError> {
     let url = format!("{}/api/file_storage/{}/usage", self.base_url, workspace_id);
     let resp = self
@@ -1260,26 +1021,89 @@ impl Client {
       .await?
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<WorkspaceSpaceUsage>::from_response(resp)
-      .await?
-      .into_data()
+    process_response_data::<WorkspaceSpaceUsage>(resp).await
   }
 
-  pub async fn get_workspace_all_blob_metadata(
-    &self,
-    workspace_id: &str,
-  ) -> Result<RepeatedBlobMetaData, AppResponseError> {
-    let url = format!("{}/api/file_storage/{}/blobs", self.base_url, workspace_id);
+  #[instrument(level = "info", skip_all)]
+  pub async fn get_server_info(&self) -> Result<ServerInfoResponseItem, AppResponseError> {
+    let url = format!("{}/api/server", self.base_url);
     let resp = self
       .http_client_with_auth(Method::GET, &url)
       .await?
       .send()
       .await?;
-    log_request_id(&resp);
-    AppResponse::<RepeatedBlobMetaData>::from_response(resp)
-      .await?
-      .into_data()
+    if resp.status() == StatusCode::NOT_FOUND {
+      Err(AppResponseError::new(
+        ErrorCode::Unhandled,
+        "server info not implemented",
+      ))
+    } else {
+      process_response_data::<ServerInfoResponseItem>(resp).await
+    }
+  }
+
+  /// Refreshes the access token using the stored refresh token.
+  ///
+  /// attempts to refresh the access token by sending a request to the authentication server
+  /// using the stored refresh token. If successful, it updates the stored access token with the new one
+  /// received from the server.
+  /// Refreshes the access token using the stored refresh token.
+  #[instrument(level = "debug", skip_all, err)]
+  pub async fn refresh_token(&self, reason: &str) -> Result<(), AppResponseError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    self.refresh_ret_txs.write().push(tx);
+
+    // Atomically check and set the refreshing flag to prevent race conditions
+    if self
+      .is_refreshing_token
+      .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+      .is_ok()
+    {
+      info!("refresh token reason:{}", reason);
+      let result = self.inner_refresh_token().await;
+
+      // Process all pending requests and reset state atomically
+      let mut txs_guard = self.refresh_ret_txs.write();
+      let txs = std::mem::take(&mut *txs_guard);
+      self.is_refreshing_token.store(false, Ordering::SeqCst);
+      drop(txs_guard);
+
+      // Send results to all waiting requests
+      for tx in txs {
+        let _ = tx.send(result.clone());
+      }
+    } else {
+      debug!("refresh token is already in progress");
+    }
+
+    // Wait for the result of the refresh token request.
+    match tokio::time::timeout(Duration::from_secs(60), rx).await {
+      Ok(Ok(result)) => result,
+      Ok(Err(err)) => {
+        Err(AppError::Internal(anyhow!("refresh token channel error: {}", err)).into())
+      },
+      Err(_) => Err(AppError::RequestTimeout("refresh token timeout".to_string()).into()),
+    }
+  }
+
+  async fn inner_refresh_token(&self) -> Result<(), AppResponseError> {
+    let retry_strategy = FixedInterval::new(Duration::from_secs(2)).take(4);
+    let action = RefreshTokenAction::new(self.token.clone(), self.gotrue_client.clone());
+    match RetryIf::spawn(retry_strategy, action, RefreshTokenRetryCondition).await {
+      Ok(_) => {
+        event!(tracing::Level::INFO, "refresh token success");
+        Ok(())
+      },
+      Err(err) => {
+        let err = AppError::from(err);
+        event!(tracing::Level::ERROR, "refresh token failed: {}", err);
+        // If the error is an OAuth error, unset the token.
+        if err.is_unauthorized() {
+          self.token.write().unset();
+        }
+        Err(err.into())
+      },
+    }
   }
 
   // Refresh token if given timestamp is close to the token expiration time
@@ -1294,27 +1118,14 @@ impl Client {
     Ok(())
   }
 
-  #[instrument(level = "info", skip_all)]
-  pub async fn summarize_row(
+  #[instrument(level = "debug", skip_all, err)]
+  pub async fn http_client_without_auth(
     &self,
-    params: SummarizeRowParams,
-  ) -> Result<SummarizeRowResponse, AppResponseError> {
-    let url = format!(
-      "{}/api/workspace/{}/summarize_row",
-      self.base_url, params.workspace_id
-    );
-
-    let resp = self
-      .http_client_with_auth(Method::POST, &url)
-      .await?
-      .json(&params)
-      .send()
-      .await?;
-
-    log_request_id(&resp);
-    AppResponse::<SummarizeRowResponse>::from_response(resp)
-      .await?
-      .into_data()
+    method: Method,
+    url: &str,
+  ) -> Result<RequestBuilder, AppResponseError> {
+    trace!("start request: {}, method: {}", url, method,);
+    Ok(self.cloud_client.request(method, url))
   }
 
   #[instrument(level = "debug", skip_all, err)]
@@ -1329,15 +1140,44 @@ impl Client {
       .await?;
 
     let access_token = self.access_token()?;
-    trace!("start request: {}, method: {}", url, method);
-    let request_builder = self
+    let headers = [
+      ("client-version", self.client_version.to_string()),
+      ("client-timestamp", ts_now.to_string()),
+      ("device-id", self.device_id.clone()),
+    ];
+    trace!(
+      "start request: {}, method: {}, headers: {:?}",
+      url,
+      method,
+      headers
+    );
+
+    let mut request_builder = self
       .cloud_client
       .request(method, url)
-      .header("client-version", self.client_version.to_string())
-      .header("client-timestamp", ts_now.to_string())
-      .header("device_id", self.device_id.clone())
       .bearer_auth(access_token);
+
+    for header in headers {
+      request_builder = request_builder.header(header.0, header.1);
+    }
     Ok(request_builder)
+  }
+
+  #[instrument(level = "debug", skip_all, err)]
+  pub async fn http_client_with_model(
+    &self,
+    method: Method,
+    url: &str,
+    ai_model: Option<String>,
+  ) -> Result<RequestBuilder, AppResponseError> {
+    let mut builder = self.http_client_with_auth(method, url).await?;
+    let effective_ai_model = match ai_model {
+      Some(model) => model,
+      None => self.ai_model.read().clone(),
+    };
+
+    builder = builder.header("ai-model", effective_ai_model);
+    Ok(builder)
   }
 
   #[instrument(level = "debug", skip_all, err)]
@@ -1369,7 +1209,7 @@ impl Client {
   }
 
   #[instrument(level = "info", skip_all)]
-  pub(crate) fn batch_create_collab_url(&self, workspace_id: &str) -> String {
+  pub(crate) fn batch_create_collab_url(&self, workspace_id: &Uuid) -> String {
     format!(
       "{}/api/workspace/{}/batch/collab",
       self.base_url, workspace_id
@@ -1390,37 +1230,89 @@ fn url_missing_param(param: &str) -> AppResponseError {
   AppError::InvalidRequest(format!("Url Missing Parameter:{}", param)).into()
 }
 
-pub(crate) fn log_request_id(resp: &reqwest::Response) {
-  if let Some(request_id) = resp.headers().get("x-request-id") {
-    event!(tracing::Level::INFO, "request_id: {:?}", request_id);
-  } else {
-    event!(tracing::Level::DEBUG, "request_id: not found");
-  }
-}
-
 #[cfg(feature = "enable_brotli")]
-pub async fn spawn_blocking_brotli_compress(
+pub fn brotli_compress(
   data: Vec<u8>,
   quality: u32,
   buffer_size: usize,
 ) -> Result<Vec<u8>, AppError> {
-  tokio::task::spawn_blocking(move || {
-    let mut compressor = brotli::CompressorReader::new(&*data, buffer_size, quality, 22);
-    let mut compressed_data = Vec::new();
-    compressor
-      .read_to_end(&mut compressed_data)
-      .map_err(|err| AppError::InvalidRequest(format!("Failed to compress data: {}", err)))?;
-    Ok(compressed_data)
-  })
-  .await
-  .map_err(AppError::from)?
+  let mut compressor = brotli::CompressorReader::new(&*data, buffer_size, quality, 22);
+  let mut compressed_data = Vec::new();
+  compressor
+    .read_to_end(&mut compressed_data)
+    .map_err(|err| AppError::InvalidRequest(format!("Failed to compress data: {}", err)))?;
+  Ok(compressed_data)
+}
+
+#[cfg(feature = "enable_brotli")]
+pub async fn blocking_brotli_compress(
+  data: Vec<u8>,
+  quality: u32,
+  buffer_size: usize,
+) -> Result<Vec<u8>, AppError> {
+  tokio::task::spawn_blocking(move || brotli_compress(data, quality, buffer_size))
+    .await
+    .map_err(AppError::from)?
 }
 
 #[cfg(not(feature = "enable_brotli"))]
-pub async fn spawn_blocking_brotli_compress(
+pub async fn blocking_brotli_compress(
   data: Vec<u8>,
   _quality: u32,
   _buffer_size: usize,
 ) -> Result<Vec<u8>, AppError> {
   Ok(data)
+}
+
+#[cfg(not(feature = "enable_brotli"))]
+pub fn brotli_compress(
+  data: Vec<u8>,
+  _quality: u32,
+  _buffer_size: usize,
+) -> Result<Vec<u8>, AppError> {
+  Ok(data)
+}
+fn attach_request_id(
+  mut err: AppResponseError,
+  request_id: impl std::fmt::Debug,
+) -> AppResponseError {
+  err.message = Cow::Owned(format!("{}. request_id: {:?}", err.message, request_id));
+  err
+}
+
+pub async fn process_response_data<T>(resp: reqwest::Response) -> Result<T, AppResponseError>
+where
+  T: serde::de::DeserializeOwned + 'static,
+{
+  let request_id = extract_request_id(&resp);
+
+  AppResponse::<T>::from_response(resp)
+    .await
+    .map_err(|err| {
+      error!(
+        "Error parsing response, request_id: {:?}, error: {}",
+        request_id, err
+      );
+      AppResponseError::from(err)
+    })
+    .and_then(|app_response| {
+      app_response
+        .into_data()
+        .map_err(|err| attach_request_id(err, &request_id))
+    })
+}
+
+pub async fn process_response_error(resp: reqwest::Response) -> Result<(), AppResponseError> {
+  let request_id = extract_request_id(&resp);
+
+  AppResponse::<()>::from_response(resp)
+    .await?
+    .into_error()
+    .map_err(|err| attach_request_id(err, &request_id))
+}
+fn extract_request_id(resp: &reqwest::Response) -> Option<String> {
+  resp
+    .headers()
+    .get("x-request-id")
+    .map(|v| v.to_str().unwrap_or("invalid").to_string())
 }

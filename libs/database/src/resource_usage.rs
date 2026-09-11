@@ -1,14 +1,14 @@
-use std::ops::DerefMut;
-
 use crate::pg_row::AFBlobMetadataRow;
 use app_error::AppError;
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::types::Decimal;
-use sqlx::{PgPool, Transaction};
+use sqlx::{Executor, PgPool, Postgres, Transaction};
+use std::ops::DerefMut;
+
 use tracing::instrument;
 use uuid::Uuid;
 
-#[instrument(level = "trace", skip_all, err)]
+#[instrument(level = "trace", skip_all)]
 #[inline]
 pub async fn is_blob_metadata_exists(
   pool: &PgPool,
@@ -34,7 +34,7 @@ pub async fn is_blob_metadata_exists(
 
 #[instrument(level = "trace", skip_all, err)]
 pub async fn insert_blob_metadata(
-  tx: &mut Transaction<'_, sqlx::Postgres>,
+  pg_pool: &PgPool,
   file_id: &str,
   workspace_id: &Uuid,
   file_type: &str,
@@ -54,13 +54,61 @@ pub async fn insert_blob_metadata(
     file_type,
     file_size as i64,
   )
-  .execute(tx.deref_mut())
+  .execute(pg_pool)
   .await?;
   let n = res.rows_affected();
-  assert_eq!(n, 1);
+  if n != 1 {
+    tracing::error!("insert_blob_metadata: rows_affected: {}", n);
+  }
   Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct BulkInsertMeta {
+  pub object_id: String,
+  pub file_id: String,
+  pub file_type: String,
+  pub file_size: i64,
+}
+
+#[instrument(level = "trace", skip_all, err)]
+pub async fn insert_blob_metadata_bulk<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  workspace_id: &Uuid,
+  metadata: Vec<BulkInsertMeta>,
+) -> Result<u64, sqlx::Error> {
+  let mut file_ids = Vec::with_capacity(metadata.len());
+  let mut file_types = Vec::with_capacity(metadata.len());
+  let mut file_sizes = Vec::with_capacity(metadata.len());
+
+  for BulkInsertMeta {
+    object_id,
+    file_id,
+    file_type,
+    file_size,
+  } in metadata
+  {
+    // we use BlobPathV1 to generate file_id
+    file_ids.push(format!("{}_{}", object_id, file_id));
+    file_types.push(file_type);
+    file_sizes.push(file_size);
+  }
+  let query = r#"
+        INSERT INTO af_blob_metadata (workspace_id, file_id, file_type, file_size)
+        SELECT $1, unnest($2::text[]), unnest($3::text[]), unnest($4::int8[])
+        ON CONFLICT DO NOTHING
+    "#;
+
+  let result = sqlx::query(query)
+    .bind(workspace_id)
+    .bind(file_ids)
+    .bind(file_types)
+    .bind(file_sizes)
+    .execute(executor)
+    .await?;
+
+  Ok(result.rows_affected())
+}
 #[instrument(level = "trace", skip_all, err)]
 #[inline]
 pub async fn delete_blob_metadata(
@@ -79,7 +127,7 @@ pub async fn delete_blob_metadata(
   .execute(tx.deref_mut())
   .await?;
   let n = result.rows_affected();
-  assert_eq!(n, 1);
+  tracing::info!("delete_blob_metadata: rows_affected: {}", n);
   Ok(())
 }
 
@@ -87,8 +135,14 @@ pub async fn delete_blob_metadata(
 pub async fn get_blob_metadata(
   pg_pool: &PgPool,
   workspace_id: &Uuid,
-  file_id: &str,
+  metadata_key: &str,
 ) -> Result<AFBlobMetadataRow, AppError> {
+  tracing::trace!(
+    "get_blob_metadata: workspace_id: {}, metadata_key: {}",
+    workspace_id,
+    metadata_key
+  );
+  // file_id is the BlobPath's blob_metadata_key
   let metadata = sqlx::query_as!(
     AFBlobMetadataRow,
     r#"
@@ -96,7 +150,7 @@ pub async fn get_blob_metadata(
         WHERE workspace_id = $1 AND file_id = $2
         "#,
     workspace_id,
-    file_id,
+    metadata_key,
   )
   .fetch_one(pg_pool)
   .await?;

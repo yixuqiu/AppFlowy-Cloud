@@ -2,6 +2,21 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
+#[derive(Debug, Serialize)]
+pub struct GoTrueServiceRoleClaims {
+  pub role: String,
+}
+
+impl GoTrueServiceRoleClaims {
+  pub fn encode(&self, jwt_secret: &[u8]) -> Result<String, jsonwebtoken::errors::Error> {
+    jsonwebtoken::encode(
+      &jsonwebtoken::Header::default(),
+      &self,
+      &jsonwebtoken::EncodingKey::from_secret(jwt_secret),
+    )
+  }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GoTrueJWTClaims {
   // JWT standard claims
@@ -47,18 +62,5 @@ impl GoTrueJWTClaims {
   pub fn decode(token: &str, secret: &[u8]) -> Result<Self, jsonwebtoken::errors::Error> {
     let token_data = decode::<Self>(token, &DecodingKey::from_secret(secret), &VALIDATION)?;
     Ok(token_data.claims)
-  }
-
-  pub fn verify_claim(claims: &GoTrueJWTClaims) -> Result<(), jsonwebtoken::errors::Error> {
-    let ts_expiry = claims.exp.ok_or_else(|| {
-      jsonwebtoken::errors::ErrorKind::MissingRequiredClaim("expect exp but not found".to_owned())
-    })?;
-
-    let ts_now = chrono::Utc::now().timestamp();
-    if ts_now > ts_expiry {
-      Err(jsonwebtoken::errors::ErrorKind::ExpiredSignature.into())
-    } else {
-      Ok(())
-    }
   }
 }

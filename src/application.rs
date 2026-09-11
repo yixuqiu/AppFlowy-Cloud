@@ -1,51 +1,82 @@
-use crate::api::metrics::metrics_scope;
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::api::file_storage::file_storage_scope;
-use crate::api::user::user_scope;
-use crate::api::workspace::{collab_scope, workspace_scope};
-use crate::api::ws::ws_scope;
-use crate::mailer::Mailer;
-use access_control::access::{enable_access_control, AccessControl};
-
-use crate::biz::actix_ws::server::RealtimeServerActor;
-use crate::biz::casbin::{
-  CollabAccessControlImpl, RealtimeCollabAccessControlImpl, WorkspaceAccessControlImpl,
+use access_control::casbin::access::AccessControl;
+use access_control::casbin::collab::{CollabAccessControlImpl, RealtimeCollabAccessControlImpl};
+use access_control::casbin::workspace::WorkspaceAccessControlImpl;
+use access_control::collab::{CollabAccessControl, RealtimeAccessControl};
+use access_control::noops::collab::{
+  CollabAccessControlImpl as NoOpsCollabAccessControlImpl,
+  RealtimeCollabAccessControlImpl as NoOpsRealtimeCollabAccessControlImpl,
 };
-use crate::biz::collab::access_control::{
-  CollabMiddlewareAccessControl, CollabStorageAccessControlImpl,
-};
-use crate::biz::collab::cache::CollabCache;
-use crate::biz::collab::storage::CollabStorageImpl;
-use crate::biz::pg_listener::PgListeners;
-use crate::biz::snapshot::SnapshotControl;
-use crate::biz::workspace::access_control::WorkspaceMiddlewareAccessControl;
-use crate::config::config::{Config, DatabaseSetting, GoTrueSetting, S3Setting};
-use crate::middleware::access_control_mw::MiddlewareAccessControlTransform;
-use crate::middleware::metrics_mw::MetricsMiddleware;
-use crate::middleware::request_id::RequestIdMiddleware;
-use crate::self_signed::create_self_signed_certificate;
-use crate::state::{AppMetrics, AppState, GoTrueAdmin, UserCache};
-use actix::Supervisor;
+use access_control::noops::workspace::WorkspaceAccessControlImpl as NoOpsWorkspaceAccessControlImpl;
+use access_control::workspace::WorkspaceAccessControl;
+use actix::{Actor, Supervisor};
+#[cfg(feature = "use_actix_cors")]
+use actix_cors::Cors;
 use actix_identity::IdentityMiddleware;
 use actix_session::storage::RedisSessionStore;
 use actix_session::SessionMiddleware;
 use actix_web::cookie::Key;
-use actix_web::{dev::Server, web, web::Data, App, HttpServer};
+use actix_web::middleware::NormalizePath;
+use actix_web::{dev::Server, web, web::Data, App, HttpResponse, HttpServer, Responder};
 use anyhow::{Context, Error};
-use appflowy_ai_client::client::AppFlowyAIClient;
-use appflowy_collaborate::command::{CLCommandReceiver, CLCommandSender};
-use appflowy_collaborate::CollaborationServer;
-use database::file::bucket_s3_impl::S3BucketStorage;
-use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
-use openssl::x509::X509;
-use secrecy::{ExposeSecret, Secret};
-use snowflake::Snowflake;
+use aws_sdk_s3::config::{Credentials, Region, SharedCredentialsProvider};
+use aws_sdk_s3::operation::create_bucket::CreateBucketError;
+use aws_sdk_s3::types::{
+  BucketInfo, BucketLocationConstraint, BucketType, CreateBucketConfiguration,
+};
+use mailer::config::MailerSetting;
+use secrecy::ExposeSecret;
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::net::TcpListener;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info};
+
+use appflowy_ai_client::client::AppFlowyAIClient;
+use appflowy_collaborate::actix_ws::server::RealtimeServerActor;
+use appflowy_collaborate::collab::cache::CollabCache;
+use appflowy_collaborate::collab::collab_store::CollabStoreImpl;
+use appflowy_collaborate::ws2::{CollabManager, WsServer};
+use appflowy_collaborate::CollaborationServer;
+use collab_stream::awareness_gossip::AwarenessGossip;
+use collab_stream::metrics::CollabStreamMetrics;
+use collab_stream::stream_router::{StreamRouter, StreamRouterOptions};
+use database::file::s3_client_impl::{AwsS3BucketClientImpl, S3BucketStorage};
+use indexer::collab_indexer::IndexerProvider;
+use indexer::scheduler::{IndexerConfiguration, IndexerScheduler};
+use indexer::vector::embedder::get_open_ai_config;
+use infra::env_util::get_env_var;
+use infra::thread_pool::ThreadPoolNoAbortBuilder;
+use mailer::sender::Mailer;
+use snowflake::Snowflake;
+
+use crate::api::access_request::access_request_scope;
+use crate::api::ai::ai_completion_scope;
+use crate::api::chat::chat_scope;
+use crate::api::data_import::data_import_scope;
+use crate::api::file_storage::file_storage_scope;
+use crate::api::guest::sharing_scope;
+use crate::api::invite_code::invite_code_scope;
+use crate::api::metrics::metrics_scope;
+use crate::api::search::search_scope;
+use crate::api::server_info::server_info_scope;
+use crate::api::template::template_scope;
+use crate::api::user::user_scope;
+use crate::api::workspace::{collab_scope, workspace_scope};
+use crate::api::ws::ws_scope;
+use crate::biz::notification::email::EmailNotificationWorker;
+use crate::biz::pg_listener::PgListeners;
+use crate::biz::workspace::publish::{
+  PublishedCollabPostgresStore, PublishedCollabS3StoreWithPostgresFallback, PublishedCollabStore,
+};
+use crate::config::config::{
+  Config, DatabaseSetting, GoTrueSetting, PublishedCollabStorageBackend, S3Setting,
+};
+use crate::mailer::AFCloudMailer;
+use crate::middleware::metrics_mw::MetricsMiddleware;
+use crate::middleware::request_id::RequestIdMiddleware;
+use crate::state::{AppMetrics, AppState, GoTrueAdmin, UserCache};
 
 pub struct Application {
   port: u16,
@@ -53,15 +84,12 @@ pub struct Application {
 }
 
 impl Application {
-  pub async fn build(
-    config: Config,
-    state: AppState,
-    rt_cmd_recv: CLCommandReceiver,
-  ) -> Result<Self, Error> {
+  pub async fn build(config: Config, state: AppState) -> Result<Self, Error> {
     let address = format!("{}:{}", config.application.host, config.application.port);
     let listener = TcpListener::bind(&address)?;
     let port = listener.local_addr().unwrap().port();
-    let actix_server = run_actix_server(listener, state, config, rt_cmd_recv).await?;
+    info!("Server started at {}", listener.local_addr().unwrap());
+    let actix_server = run_actix_server(listener, state, config).await?;
 
     Ok(Self { port, actix_server })
   }
@@ -79,8 +107,7 @@ pub async fn run_actix_server(
   listener: TcpListener,
   state: AppState,
   config: Config,
-  rt_cmd_recv: CLCommandReceiver,
-) -> Result<Server, anyhow::Error> {
+) -> Result<Server, Error> {
   let redis_store = RedisSessionStore::new(config.redis_uri.expose_secret())
     .await
     .map_err(|e| {
@@ -90,80 +117,73 @@ pub async fn run_actix_server(
         e
       )
     })?;
-  let pair = get_certificate_and_server_key(&config);
-  let key = pair
-    .as_ref()
-    .map(|(_, server_key)| Key::from(server_key.expose_secret().as_bytes()))
-    .unwrap_or_else(Key::generate);
 
-  let storage = state.collab_access_control_storage.clone();
-  let access_control = MiddlewareAccessControlTransform::new()
-    .with_acs(WorkspaceMiddlewareAccessControl::new(
-      state.pg_pool.clone(),
-      state.workspace_access_control.clone().into(),
-    ))
-    .with_acs(CollabMiddlewareAccessControl::new(
-      state.collab_access_control.clone().into(),
-      state.collab_cache.clone(),
-    ));
+  let storage = state.collab_storage.clone();
 
   // Initialize metrics that which are registered in the registry.
-  let realtime_server = CollaborationServer::<_, _>::new(
+  let realtime_server = CollaborationServer::new(
     storage.clone(),
-    RealtimeCollabAccessControlImpl::new(state.access_control.clone()),
+    state.realtime_access_control.clone(),
     state.metrics.realtime_metrics.clone(),
-    rt_cmd_recv,
+    state.redis_stream_router.clone(),
+    state.awareness_gossip.clone(),
+    state.redis_connection_manager.clone(),
+    Duration::from_secs(config.collab.group_persistence_interval_secs),
+    state.indexer_scheduler.clone(),
   )
+  .await
   .unwrap();
 
   let realtime_server_actor = Supervisor::start(|_| RealtimeServerActor(realtime_server));
   let mut server = HttpServer::new(move || {
-    App::new()
+    let app = App::new()
+      .wrap(NormalizePath::trim())
        // Middleware is registered for each App, scope, or Resource and executed in opposite order as registration
       .wrap(MetricsMiddleware)
       .wrap(IdentityMiddleware::default())
       .wrap(
-        SessionMiddleware::builder(redis_store.clone(), key.clone())
+        SessionMiddleware::builder(redis_store.clone(), Key::generate())
           .build(),
       )
-      // .wrap(DecryptPayloadMiddleware)
-      .wrap(access_control.clone())
-      .wrap(RequestIdMiddleware)
-      .app_data(web::JsonConfig::default().limit(5 * 1024 * 1024))
+      .wrap(RequestIdMiddleware);
+
+    #[cfg(feature = "use_actix_cors")]
+    let app = app.wrap(actix_cors_scope());
+
+    app
+      .service(server_info_scope())
       .service(user_scope())
       .service(workspace_scope())
+      .service(invite_code_scope())
       .service(collab_scope())
       .service(ws_scope())
       .service(file_storage_scope())
+      .service(chat_scope())
+      .service(ai_completion_scope())
       .service(metrics_scope())
+      .service(search_scope())
+      .service(template_scope())
+      .service(data_import_scope())
+      .service(access_request_scope())
+      .service(sharing_scope())
+      .route("/health", web::get().to(health_check))
       .app_data(Data::new(state.metrics.registry.clone()))
       .app_data(Data::new(state.metrics.request_metrics.clone()))
       .app_data(Data::new(state.metrics.realtime_metrics.clone()))
       .app_data(Data::new(state.metrics.access_control_metrics.clone()))
       .app_data(Data::new(realtime_server_actor.clone()))
+      .app_data(Data::new(state.config.gotrue.jwt_secret.clone()))
       .app_data(Data::new(state.clone()))
       .app_data(Data::new(storage.clone()))
+      .app_data(Data::new(state.published_collab_store.clone()))
   });
 
-  server = match pair {
-    None => server.listen(listener)?,
-    Some((certificate, _)) => {
-      server.listen_openssl(listener, make_ssl_acceptor_builder(certificate))?
-    },
-  };
+  server = server.listen(listener)?;
 
   Ok(server.run())
 }
 
-fn get_certificate_and_server_key(config: &Config) -> Option<(Secret<String>, Secret<String>)> {
-  if config.application.use_tls {
-    Some(create_self_signed_certificate().unwrap())
-  } else {
-    None
-  }
-}
-
-pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<AppState, Error> {
+pub async fn init_state(config: &Config) -> Result<AppState, Error> {
   // Print the feature flags
 
   let metrics = AppMetrics::new();
@@ -175,77 +195,178 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
 
   // Bucket storage
   info!("Setting up S3 bucket...");
-  let s3_bucket = get_aws_s3_bucket(&config.s3).await?;
-  let bucket_storage = Arc::new(S3BucketStorage::from_s3_bucket(s3_bucket, pg_pool.clone()));
+  let s3_client = AwsS3BucketClientImpl::new(
+    get_aws_s3_client(&config.s3).await?,
+    config.s3.bucket.clone(),
+    config.s3.minio_url.clone(),
+    config.s3.presigned_url_endpoint.clone(),
+  );
+  let bucket_storage = Arc::new(S3BucketStorage::from_bucket_impl(
+    s3_client.clone(),
+    pg_pool.clone(),
+  ));
+
+  // Published Collab Storage
+  info!("Setting up Published Collab storage...");
+  let published_collab_store: Arc<dyn PublishedCollabStore> =
+    match config.published_collab.storage_backend {
+      PublishedCollabStorageBackend::Postgres => {
+        info!("Using Postgres as the Published Collab storage backend ...");
+        Arc::new(PublishedCollabPostgresStore::new(
+          metrics.published_collab_metrics.clone(),
+          pg_pool.clone(),
+        ))
+      },
+      PublishedCollabStorageBackend::S3WithPostgresBackup => {
+        info!("Using S3 as the Published Collab storage backend with Postgres as the backup ...");
+        Arc::new(PublishedCollabS3StoreWithPostgresFallback::new(
+          metrics.published_collab_metrics.clone(),
+          pg_pool.clone(),
+          s3_client.clone(),
+        ))
+      },
+    };
 
   // Gotrue
   info!("Connecting to GoTrue...");
   let gotrue_client = get_gotrue_client(&config.gotrue).await?;
-  let gotrue_admin = setup_admin_account(&gotrue_client, &pg_pool, &config.gotrue).await?;
+  let gotrue_admin = get_admin_client(gotrue_client.clone(), &config.gotrue);
 
   // Redis
   info!("Connecting to Redis...");
-  let redis_conn_manager = get_redis_client(config.redis_uri.expose_secret()).await?;
+  let (redis_conn_manager, redis_stream_router, awareness_gossip) = get_redis_client(
+    config.redis_uri.expose_secret(),
+    config.redis_worker_count,
+    metrics.collab_stream_metrics.clone(),
+  )
+  .await?;
 
-  info!("Connecting to AppFlowy AI: {}", config.appflowy_ai.url());
+  info!("Setup AppFlowy AI: {}", config.appflowy_ai.url());
   let appflowy_ai_client = AppFlowyAIClient::new(&config.appflowy_ai.url());
-
   // Pg listeners
   info!("Setting up Pg listeners...");
   let pg_listeners = Arc::new(PgListeners::new(&pg_pool).await?);
   // let collab_member_listener = pg_listeners.subscribe_collab_member_change();
-  // let workspace_member_listener = pg_listeners.subscribe_workspace_member_change();
+
+  let use_redis_ac_cache = get_env_var("APPFLOWY_ACCESS_CONTROL_REDIS_CACHE_ENABLED", "false")
+    .parse::<bool>()
+    .unwrap_or(false);
 
   info!(
-    "Setting up access controls, is_enable: {}",
-    enable_access_control()
+    "Setting up access controls, is_enable: {}, use redis cache: {}",
+    &config.access_control.is_enabled, use_redis_ac_cache,
   );
-  let access_control =
-    AccessControl::new(pg_pool.clone(), metrics.access_control_metrics.clone()).await?;
 
-  // spawn_listen_on_workspace_member_change(workspace_member_listener, access_control.clone());
-  // spawn_listen_on_collab_member_change(
-  //   pg_pool.clone(),
-  //   collab_member_listener,
-  //   access_control.clone(),
-  // );
-
-  let user_cache = UserCache::new(pg_pool.clone()).await;
-  let collab_access_control = CollabAccessControlImpl::new(access_control.clone());
-  let workspace_access_control = WorkspaceAccessControlImpl::new(access_control.clone());
-  let collab_cache = CollabCache::new(redis_conn_manager.clone(), pg_pool.clone());
-
-  let collab_storage_access_control = CollabStorageAccessControlImpl {
-    collab_access_control: collab_access_control.clone().into(),
-    workspace_access_control: workspace_access_control.clone().into(),
-    cache: collab_cache.clone(),
+  let redis_uri = if use_redis_ac_cache {
+    Some(config.redis_uri.expose_secret().as_str())
+  } else {
+    None
   };
-  let snapshot_control = SnapshotControl::new(
-    redis_conn_manager.clone(),
+
+  let access_control = AccessControl::new(
     pg_pool.clone(),
-    metrics.collab_metrics.clone(),
-  )
-  .await;
-  let collab_storage = Arc::new(CollabStorageImpl::new(
-    collab_cache.clone(),
-    collab_storage_access_control,
-    snapshot_control,
-    rt_cmd_tx,
-    redis_conn_manager.clone(),
-    metrics.collab_metrics.clone(),
-  ));
-
-  #[cfg(feature = "history")]
-  let grpc_history_client =
-    tonic_proto::history::history_client::HistoryClient::connect(config.grpc_history.addrs.clone())
-      .await?;
-
-  let mailer = Mailer::new(
-    config.mailer.smtp_username.clone(),
-    config.mailer.smtp_password.expose_secret().clone(),
-    &config.mailer.smtp_host,
+    redis_uri,
+    metrics.access_control_metrics.clone(),
   )
   .await?;
+
+  let user_cache = UserCache::new(pg_pool.clone()).await;
+  let collab_access_control: Arc<dyn CollabAccessControl> =
+    if config.access_control.is_enabled && config.access_control.enable_collab_access_control {
+      Arc::new(CollabAccessControlImpl::new(access_control.clone()))
+    } else {
+      Arc::new(NoOpsCollabAccessControlImpl::new())
+    };
+  let workspace_access_control: Arc<dyn WorkspaceAccessControl> =
+    if config.access_control.is_enabled && config.access_control.enable_workspace_access_control {
+      Arc::new(WorkspaceAccessControlImpl::new(access_control.clone()))
+    } else {
+      Arc::new(NoOpsWorkspaceAccessControlImpl::new())
+    };
+
+  // thread pool
+  let thread_pool = Arc::new(
+    ThreadPoolNoAbortBuilder::new()
+      .thread_name(|idx| format!("af-collab-worker-{}", idx))
+      .num_threads(4)
+      .build()
+      .expect("Failed to create collab thread pool"),
+  );
+
+  let realtime_access_control: Arc<dyn RealtimeAccessControl> =
+    if config.access_control.is_enabled && config.access_control.enable_realtime_access_control {
+      Arc::new(RealtimeCollabAccessControlImpl::new(access_control))
+    } else {
+      Arc::new(NoOpsRealtimeCollabAccessControlImpl::new())
+    };
+  let collab_cache = CollabCache::new(
+    thread_pool.clone(),
+    redis_conn_manager.clone(),
+    pg_pool.clone(),
+    s3_client.clone(),
+    metrics.collab_metrics.clone(),
+    config.collab.s3_collab_threshold as usize,
+  );
+
+  let collab_access_control_storage = Arc::new(CollabStoreImpl::new(
+    collab_cache.clone(),
+    collab_access_control.clone(),
+    workspace_access_control.clone(),
+  ));
+
+  let mailer = get_mailer(&config.mailer).await?;
+  if config.notification.enable_email_notification {
+    info!("Setting up background notification worker...");
+    let email_notification_interval = config.notification.email_notification_interval_secs;
+    let email_notification_grace_period = config.notification.email_notification_grace_period_secs;
+    let task_appflowy_web_url = config.appflowy_web_url.clone();
+    let task_mailer = mailer.clone();
+    let task_pg_pool = pg_pool.clone();
+    tokio::spawn(async move {
+      let email_notification_worker = EmailNotificationWorker::new(
+        task_pg_pool,
+        task_mailer,
+        email_notification_interval,
+        email_notification_grace_period,
+        &task_appflowy_web_url,
+      );
+      email_notification_worker.start_task().await;
+    });
+  }
+
+  info!("Setting up Indexer scheduler...");
+  let (open_ai_config, azure_ai_config) = get_open_ai_config();
+  let embedder_config = IndexerConfiguration {
+    enable: get_env_var("APPFLOWY_INDEXER_ENABLED", "true")
+      .parse::<bool>()
+      .unwrap_or(true),
+    open_ai_config,
+    azure_ai_config,
+    embedding_buffer_size: appflowy_collaborate::config::get_env_var(
+      "APPFLOWY_INDEXER_EMBEDDING_BUFFER_SIZE",
+      "5000",
+    )
+    .parse::<usize>()
+    .unwrap_or(5000),
+  };
+  let indexer_scheduler = IndexerScheduler::new(
+    IndexerProvider::new(),
+    pg_pool.clone(),
+    collab_access_control_storage.clone(),
+    metrics.embedding_metrics.clone(),
+    embedder_config,
+    redis_conn_manager.clone(),
+  );
+  let manager = CollabManager::new(
+    thread_pool.clone(),
+    collab_access_control.clone(),
+    collab_cache.clone(),
+    redis_conn_manager.clone(),
+    redis_stream_router.clone(),
+    awareness_gossip.clone(),
+    indexer_scheduler.clone(),
+  );
+  let ws_server = WsServer::new(manager).start();
 
   info!("Application state initialized");
   Ok(AppState {
@@ -254,135 +375,164 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
     user_cache,
     id_gen: Arc::new(RwLock::new(Snowflake::new(1))),
     gotrue_client,
+    redis_stream_router,
+    awareness_gossip,
     redis_connection_manager: redis_conn_manager,
     collab_cache,
-    collab_access_control_storage: collab_storage,
+    collab_storage: collab_access_control_storage,
     collab_access_control,
     workspace_access_control,
+    realtime_access_control,
     bucket_storage,
+    published_collab_store,
+    bucket_client: s3_client,
     pg_listeners,
-    access_control,
     metrics,
     gotrue_admin,
     mailer,
     ai_client: appflowy_ai_client,
-    #[cfg(feature = "history")]
-    grpc_history_client,
+    indexer_scheduler,
+    ws_server,
   })
 }
 
-async fn setup_admin_account(
-  gotrue_client: &gotrue::api::Client,
-  pg_pool: &PgPool,
+fn get_admin_client(
+  gotrue_client: gotrue::api::Client,
   gotrue_setting: &GoTrueSetting,
-) -> Result<GoTrueAdmin, Error> {
-  let admin_email = gotrue_setting.admin_email.as_str();
-  let password = gotrue_setting.admin_password.expose_secret();
-  let gotrue_admin = GoTrueAdmin::new(admin_email.to_owned(), password.to_owned());
+) -> GoTrueAdmin {
+  GoTrueAdmin::new(
+    gotrue_setting.jwt_secret.expose_secret().to_owned(),
+    gotrue_setting.service_role.clone(),
+    gotrue_client.clone(),
+  )
+}
 
-  let res_resp = gotrue_client.sign_up(admin_email, password, None).await;
-  match res_resp {
+async fn get_redis_client(
+  redis_uri: &str,
+  worker_count: usize,
+  metrics: Arc<CollabStreamMetrics>,
+) -> Result<
+  (
+    redis::aio::ConnectionManager,
+    Arc<StreamRouter>,
+    Arc<AwarenessGossip>,
+  ),
+  Error,
+> {
+  info!("Connecting to redis with uri: {}", redis_uri);
+  let client = redis::Client::open(redis_uri).context("failed to connect to redis")?;
+
+  let awareness_gossip = AwarenessGossip::new(&client).await?;
+  let router = StreamRouter::with_options(
+    &client,
+    metrics,
+    StreamRouterOptions {
+      worker_count,
+      xread_streams: 100,
+      xread_block_millis: Some(5000),
+      xread_count: None,
+    },
+  )?;
+
+  let manager = client
+    .get_connection_manager()
+    .await
+    .context("failed to get the connection manager")?;
+  Ok((manager, router.into(), awareness_gossip.into()))
+}
+
+pub async fn get_aws_s3_client(s3_setting: &S3Setting) -> Result<aws_sdk_s3::Client, Error> {
+  let credentials = Credentials::new(
+    s3_setting.access_key.clone(),
+    s3_setting.secret_key.expose_secret().clone(),
+    None,
+    None,
+    "custom",
+  );
+  let shared_credentials = SharedCredentialsProvider::new(credentials);
+
+  // Configure the AWS SDK
+  let config_builder = aws_sdk_s3::Config::builder()
+    .credentials_provider(shared_credentials)
+    .force_path_style(true)
+    .region(Region::new(s3_setting.region.clone()));
+
+  let config = if s3_setting.use_minio {
+    config_builder.endpoint_url(&s3_setting.minio_url).build()
+  } else {
+    config_builder.build()
+  };
+  let client = aws_sdk_s3::Client::from_conf(config);
+  if s3_setting.create_bucket {
+    create_bucket_if_not_exists(&client, s3_setting).await?;
+  } else {
+    info!("Skipping bucket creation, assumed to be created externally");
+  }
+  Ok(client)
+}
+
+async fn create_bucket_if_not_exists(
+  client: &aws_sdk_s3::Client,
+  s3_setting: &S3Setting,
+) -> Result<(), Error> {
+  let bucket_cfg = if s3_setting.use_minio {
+    CreateBucketConfiguration::builder()
+      .bucket(BucketInfo::builder().r#type(BucketType::Directory).build())
+      .build()
+  } else {
+    CreateBucketConfiguration::builder()
+      .location_constraint(BucketLocationConstraint::from(s3_setting.region.as_str()))
+      .build()
+  };
+
+  match client
+    .create_bucket()
+    .bucket(&s3_setting.bucket)
+    .create_bucket_configuration(bucket_cfg)
+    .send()
+    .await
+  {
+    Ok(_) => {
+      info!(
+        "bucket created successfully: {}, region: {}",
+        s3_setting.bucket, s3_setting.region
+      );
+      Ok(())
+    },
     Err(err) => {
-      if let app_error::gotrue::GoTrueError::Internal(err) = err {
-        match (err.code, err.msg.as_str()) {
-          (400, "User already registered") => {
-            info!("Admin user already registered");
-            Ok(gotrue_admin)
+      if let Some(service_error) = err.as_service_error() {
+        match service_error {
+          CreateBucketError::BucketAlreadyOwnedByYou(_)
+          | CreateBucketError::BucketAlreadyExists(_) => {
+            info!("Bucket already exists");
+            Ok(())
           },
-          _ => Err(err.into()),
+          _ => {
+            error!("Unhandle s3 service error: {:?}", err);
+            Err(err.into())
+          },
         }
       } else {
+        error!("Failed to create bucket: {:?}", err);
         Err(err.into())
-      }
-    },
-    Ok(resp) => {
-      let admin_user = {
-        match resp {
-          gotrue_entity::dto::SignUpResponse::Authenticated(resp) => resp.user,
-          gotrue_entity::dto::SignUpResponse::NotAuthenticated(user) => user,
-        }
-      };
-      match admin_user.role.as_str() {
-        "supabase_admin" => {
-          info!("Admin user already created and set role to supabase_admin");
-          Ok(gotrue_admin)
-        },
-        _ => {
-          let user_id = admin_user.id.parse::<uuid::Uuid>()?;
-          let result = sqlx::query!(
-            r#"
-            UPDATE auth.users
-            SET role = 'supabase_admin', email_confirmed_at = NOW()
-            WHERE id = $1
-            "#,
-            user_id,
-          )
-          .execute(pg_pool)
-          .await
-          .context("failed to update the admin user")?;
-
-          if result.rows_affected() != 1 {
-            warn!("Failed to update the admin user");
-          } else {
-            info!("Admin user created and set role to supabase_admin");
-          }
-
-          Ok(gotrue_admin)
-        },
       }
     },
   }
 }
 
-async fn get_redis_client(redis_uri: &str) -> Result<redis::aio::ConnectionManager, Error> {
-  info!("Connecting to redis with uri: {}", redis_uri);
-  let manager = redis::Client::open(redis_uri)
-    .context("failed to connect to redis")?
-    .get_connection_manager()
-    .await
-    .context("failed to get the connection manager")?;
-  Ok(manager)
-}
-
-async fn get_aws_s3_bucket(s3_setting: &S3Setting) -> Result<s3::Bucket, Error> {
-  info!("Connecting to S3 bucket with setting: {:?}", &s3_setting);
-  let region = {
-    match s3_setting.use_minio {
-      true => s3::Region::Custom {
-        region: s3_setting.region.to_owned(),
-        endpoint: s3_setting.minio_url.to_owned(),
-      },
-      false => s3_setting
-        .region
-        .parse::<s3::Region>()
-        .context("failed to parser s3 setting")?,
-    }
-  };
-
-  let cred = s3::creds::Credentials {
-    access_key: Some(s3_setting.access_key.to_owned()),
-    secret_key: Some(s3_setting.secret_key.expose_secret().to_owned()),
-    security_token: None,
-    session_token: None,
-    expiration: None,
-  };
-
-  match s3::Bucket::create_with_path_style(
-    &s3_setting.bucket,
-    region.clone(),
-    cred.clone(),
-    s3::BucketConfiguration::default(),
+async fn get_mailer(mailer: &MailerSetting) -> Result<AFCloudMailer, Error> {
+  info!("Connecting to mailer with setting: {:?}", mailer);
+  let mailer = Mailer::new(
+    mailer.smtp_username.clone(),
+    mailer.smtp_email.clone(),
+    mailer.smtp_password.clone(),
+    &mailer.smtp_host,
+    mailer.smtp_port,
+    mailer.smtp_tls_kind.as_str(),
   )
-  .await
-  {
-    Ok(_) => Ok(()),
-    Err(e) => match e {
-      s3::error::S3Error::HttpFailWithBody(409, _) => Ok(()), // Bucket already exists
-      _ => Err(e),
-    },
-  }?;
+  .await?;
 
-  Ok(s3::Bucket::new(&s3_setting.bucket, region.clone(), cred.clone())?.with_path_style())
+  AFCloudMailer::new(mailer).await
 }
 
 async fn get_connection_pool(setting: &DatabaseSetting) -> Result<PgPool, Error> {
@@ -392,7 +542,7 @@ async fn get_connection_pool(setting: &DatabaseSetting) -> Result<PgPool, Error>
     .acquire_timeout(Duration::from_secs(10))
     .max_lifetime(Duration::from_secs(30 * 60))
     .idle_timeout(Duration::from_secs(30))
-    .connect_with(setting.with_db())
+    .connect_with(setting.pg_connect_options())
     .await
     .map_err(|e| anyhow::anyhow!("Failed to connect to postgres database: {}", e))
 }
@@ -415,21 +565,25 @@ async fn get_gotrue_client(setting: &GoTrueSetting) -> Result<gotrue::api::Clien
   Ok(gotrue_client)
 }
 
-fn make_ssl_acceptor_builder(certificate: Secret<String>) -> SslAcceptorBuilder {
-  let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-  let x509_cert = X509::from_pem(certificate.expose_secret().as_bytes()).unwrap();
-  builder.set_certificate(&x509_cert).unwrap();
-  builder
-    .set_private_key_file("./cert/key.pem", SslFiletype::PEM)
-    .unwrap();
-  builder
-    .set_certificate_chain_file("./cert/cert.pem")
-    .unwrap();
-  builder
-    .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
-    .unwrap();
-  builder
-    .set_max_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))
-    .unwrap();
-  builder
+async fn health_check() -> impl Responder {
+  HttpResponse::Ok().body("OK")
+}
+
+#[cfg(feature = "use_actix_cors")]
+fn actix_cors_scope() -> actix_cors::Cors {
+  Cors::default()
+    .allowed_origin(&get_env_var(
+      "APPFLOWY_CORS_ALLOWED_ORIGIN",
+      "http://localhost:3000",
+    ))
+    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+    .allowed_headers(vec![
+      "Content-Type",
+      "Authorization",
+      "Accept",
+      "Client-Version",
+      "Device-Id",
+      "X-Request-Id",
+    ])
+    .max_age(3600)
 }

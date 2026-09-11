@@ -5,7 +5,7 @@ use super::{
   check_response,
   entities::{
     UserProfile, UserUsageLimit, WorkspaceBlobUsage, WorkspaceDocUsage, WorkspaceMember,
-    WorkspaceUsageLimit, WorkspaceUsageLimits,
+    WorkspaceUsageLimits,
   },
   error::Error,
   from_json_response,
@@ -55,7 +55,6 @@ pub async fn get_user_workspace_limit(
 pub async fn get_user_workspace_usages(
   access_token: &str,
   appflowy_cloud_base_url: &str,
-  appflowy_cloud_gateway_base_url: &str,
 ) -> Result<Vec<WorkspaceUsageLimits>, Error> {
   let user_workspaces = get_user_owned_workspaces(access_token, appflowy_cloud_base_url).await?;
 
@@ -82,26 +81,11 @@ pub async fn get_user_workspace_usages(
         })
     };
 
-    let workspace_limits =
-      get_user_workspace_limits(&workspace_id, access_token, appflowy_cloud_gateway_base_url).await;
-    let (member_limit, total_blob_limit) = match workspace_limits {
-      Ok(limit) => (
-        limit.member_count.to_string(),
-        human_bytes::human_bytes(limit.total_blob_size as f64),
-      ),
-      Err(e) => {
-        tracing::warn!("Error getting user workspace limits: {:?}", e);
-        ("N/A".to_string(), "N/A".to_string())
-      },
-    };
-
     workspace_usages.push(WorkspaceUsageLimits {
       name: user_workspace.workspace_name,
       member_count: members.len(),
-      member_limit,
       total_doc_size,
       total_blob_size,
-      total_blob_limit,
     });
   }
 
@@ -152,24 +136,6 @@ pub async fn get_accepted_workspace_invitations(
     .get(format!(
       "{}/api/workspace/invite?status=Accepted",
       appflowy_cloud_base_url
-    ))
-    .header("Authorization", format!("Bearer {}", access_token))
-    .send()
-    .await?;
-
-  from_json_response(resp).await
-}
-
-async fn get_user_workspace_limits(
-  workspace_id: &str,
-  access_token: &str,
-  appflowy_cloud_gateway_base_url: &str,
-) -> Result<WorkspaceUsageLimit, Error> {
-  let http_client = reqwest::Client::new();
-  let resp = http_client
-    .get(format!(
-      "{}/api/workspace/{}/limit",
-      appflowy_cloud_gateway_base_url, workspace_id
     ))
     .header("Authorization", format!("Bearer {}", access_token))
     .send()
@@ -238,6 +204,8 @@ pub async fn invite_user_to_workspace(
   let invi = vec![WorkspaceMemberInvitation {
     email: user_email.to_string(),
     role: AFRole::Member,
+    skip_email_send: true,
+    ..Default::default()
   }];
 
   let http_client = reqwest::Client::new();
@@ -310,5 +278,20 @@ pub async fn verify_token_cloud(
     .send()
     .await?;
   let _: SignInTokenResponse = from_json_response(resp).await?;
+  Ok(())
+}
+
+pub async fn delete_current_user(
+  access_token: &str,
+  appflowy_cloud_base_url: &str,
+) -> Result<(), Error> {
+  let http_client = reqwest::Client::new();
+  let url = format!("{}/api/user", appflowy_cloud_base_url);
+  let resp = http_client
+    .delete(url)
+    .header("Authorization", format!("Bearer {}", access_token))
+    .send()
+    .await?;
+  check_response(resp).await?;
   Ok(())
 }

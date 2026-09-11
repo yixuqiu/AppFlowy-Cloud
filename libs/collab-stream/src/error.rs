@@ -5,6 +5,12 @@ pub enum StreamError {
   #[error(transparent)]
   RedisError(#[from] RedisError),
 
+  #[error("Stream already exist: {0}")]
+  StreamAlreadyExist(String),
+
+  #[error("Stream not exist: {0}")]
+  StreamNotExist(String),
+
   #[error("Unexpected value: {0}")]
   UnexpectedValue(String),
 
@@ -26,8 +32,23 @@ pub enum StreamError {
   #[error(transparent)]
   BinCodeSerde(#[from] bincode::Error),
 
+  #[error("failed to decode update: {0}")]
+  UpdateError(#[from] collab::preclude::encoding::read::Error),
+
+  #[error("I/O error: {0}")]
+  IO(#[from] std::io::Error),
+
   #[error("Internal error: {0}")]
   Internal(anyhow::Error),
+
+  #[error("Couldn't parse stream key: {0}")]
+  InvalidStreamKey(String),
+}
+
+impl StreamError {
+  pub fn is_stream_not_exist(&self) -> bool {
+    matches!(self, StreamError::StreamNotExist(_))
+  }
 }
 
 pub fn internal<T: ToString>(msg: T) -> RedisError {

@@ -1,14 +1,17 @@
-use crate::util::channel_ext::UnboundedSenderSink;
-use crate::RealtimeAccessControl;
+use std::sync::Arc;
+use std::time::Duration;
+
+use access_control::collab::RealtimeAccessControl;
 use async_trait::async_trait;
 use collab_rt_entity::user::RealtimeUser;
 use collab_rt_entity::ClientCollabMessage;
 use collab_rt_entity::{MessageByObjectId, RealtimeMessage};
-use std::sync::Arc;
-use std::time::Duration;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::StreamExt;
 use tracing::{error, trace};
+use uuid::Uuid;
+
+use crate::util::channel_ext::UnboundedSenderSink;
 
 #[async_trait]
 pub trait RealtimeClientWebsocketSink: Send + Sync + 'static {
@@ -28,7 +31,7 @@ pub struct ClientMessageRouter {
   ///
   /// The message flow:
   /// ClientSession(websocket) -> [CollabRealtimeServer] -> [ClientMessageRouter] -> [CollabBroadcast] 1->* websocket(client)
-  pub(crate) stream_tx: tokio::sync::broadcast::Sender<RealtimeMessage>,
+  pub(crate) stream_tx: tokio::sync::broadcast::Sender<MessageByObjectId>,
 }
 
 impl ClientMessageRouter {
@@ -50,32 +53,29 @@ impl ClientMessageRouter {
   /// - An `UnboundedSenderSink<T>`, which is used to send updates to the connected client.
   /// - A `ReceiverStream<MessageByObjectId>`, which is used to receive authorized updates from the connected client.
   ///
-  pub fn init_client_communication<T, AC>(
+  pub fn init_client_communication<T>(
     &mut self,
-    workspace_id: &str,
+    workspace_id: Uuid,
     user: &RealtimeUser,
-    object_id: &str,
-    access_control: Arc<AC>,
+    object_id: Uuid,
+    access_control: Arc<dyn RealtimeAccessControl>,
   ) -> (UnboundedSenderSink<T>, ReceiverStream<MessageByObjectId>)
   where
     T: Into<RealtimeMessage> + Send + Sync + 'static,
-    AC: RealtimeAccessControl,
   {
     let client_ws_sink = self.sink.clone();
     let mut stream_rx = BroadcastStream::new(self.stream_tx.subscribe());
-    let target_object_id = object_id.to_string();
 
     // Send the message to the connected websocket client. When the client receive the message,
     // it will apply the changes.
     let (client_sink_tx, mut client_sink_rx) = tokio::sync::mpsc::unbounded_channel::<T>();
     let sink_access_control = access_control.clone();
-    let sink_workspace_id = workspace_id.to_string();
     let uid = user.uid;
     let client_sink = UnboundedSenderSink::<T>::new(client_sink_tx);
     tokio::spawn(async move {
       while let Some(msg) = client_sink_rx.recv().await {
         let result = sink_access_control
-          .can_read_collab(&sink_workspace_id, &uid, &target_object_id)
+          .can_read_collab(&workspace_id, &uid, &object_id)
           .await;
         match result {
           Ok(is_allowed) => {
@@ -83,7 +83,7 @@ impl ClientMessageRouter {
               let rt_msg = msg.into();
               client_ws_sink.do_send(rt_msg);
             } else {
-              trace!("user:{} is not allowed to read {}", uid, target_object_id);
+              trace!("user:{} is not allowed to read {}", uid, object_id);
               tokio::time::sleep(Duration::from_secs(2)).await;
             }
           },
@@ -94,68 +94,52 @@ impl ClientMessageRouter {
         }
       }
     });
-    let target_object_id = object_id.to_string();
-    let stream_workspace_id = workspace_id.to_string();
     let user = user.clone();
     // stream_rx continuously receive messages from the websocket client and then
     // forward the message to the subscriber which is the broadcast channel [CollabBroadcast].
     let (client_msg_rx, rx) = tokio::sync::mpsc::channel(100);
     let client_stream = ReceiverStream::new(rx);
     tokio::spawn(async move {
-      while let Some(Ok(realtime_msg)) = stream_rx.next().await {
-        match realtime_msg.transform() {
-          Ok(messages_by_oid) => {
-            for (message_object_id, original_messages) in messages_by_oid {
-              // if the message is not for the target object, skip it. The stream_rx receives different
-              // objects' messages, so we need to filter out the messages that are not for the target object.
-              if target_object_id != message_object_id {
-                continue;
-              }
+      let target_object_id = object_id.to_string();
+      while let Some(Ok(messages_by_oid)) = stream_rx.next().await {
+        for (message_object_id, original_messages) in messages_by_oid.into_inner() {
+          // if the message is not for the target object, skip it. The stream_rx receives different
+          // objects' messages, so we need to filter out the messages that are not for the target object.
+          if target_object_id != message_object_id {
+            continue;
+          }
 
-              // before applying user messages, we need to check if the user has the permission
-              // valid_messages contains the messages that the user is allowed to apply
-              // invalid_message contains the messages that the user is not allowed to apply
-              let (valid_messages, invalid_message) = Self::access_control(
-                &stream_workspace_id,
-                &user.uid,
-                &message_object_id,
-                &access_control,
-                original_messages,
-              )
-              .await;
-              trace!(
-                "{} receive client:{}, device:{}, message: valid:{} invalid:{}",
-                message_object_id,
-                user.uid,
-                user.device_id,
-                valid_messages.len(),
-                invalid_message.len()
-              );
+          // before applying user messages, we need to check if the user has the permission
+          // valid_messages contains the messages that the user is allowed to apply
+          // invalid_message contains the messages that the user is not allowed to apply
+          let (valid_messages, _) = Self::access_control(
+            &workspace_id,
+            &user.uid,
+            &object_id,
+            access_control.clone(),
+            original_messages,
+          )
+          .await;
+          if valid_messages.is_empty() {
+            continue;
+          }
 
-              if valid_messages.is_empty() {
-                continue;
-              }
-
-              // if tx.send return error, it means the client is disconnected from the group
-              if let Err(err) = client_msg_rx
-                .send([(message_object_id, valid_messages)].into())
-                .await
-              {
-                trace!(
-                  "{} send message to user:{} stream fail with error: {}, break the loop",
-                  target_object_id,
-                  user.user_device(),
-                  err,
-                );
-                return;
-              }
-            }
-          },
-          Err(err) => {
-            if cfg!(debug_assertions) {
-              error!("parse client message error: {}", err);
-            }
-          },
+          // if tx.send return error, it means the client is disconnected from the group
+          if let Err(err) = client_msg_rx
+            .send(MessageByObjectId::new_with_message(
+              message_object_id,
+              valid_messages,
+            ))
+            .await
+          {
+            trace!(
+              "{} send message to user:{} stream fail with error: {}, break the loop",
+              target_object_id,
+              user.user_device(),
+              err,
+            );
+            return;
+          }
         }
       }
     });
@@ -167,16 +151,13 @@ impl ClientMessageRouter {
   }
 
   #[inline]
-  async fn access_control<AC>(
-    workspace_id: &str,
+  async fn access_control(
+    workspace_id: &Uuid,
     uid: &i64,
-    object_id: &str,
-    access_control: &Arc<AC>,
+    object_id: &Uuid,
+    access_control: Arc<dyn RealtimeAccessControl>,
     messages: Vec<ClientCollabMessage>,
-  ) -> (Vec<ClientCollabMessage>, Vec<ClientCollabMessage>)
-  where
-    AC: RealtimeAccessControl,
-  {
+  ) -> (Vec<ClientCollabMessage>, Vec<ClientCollabMessage>) {
     let can_write = access_control
       .can_write_collab(workspace_id, uid, object_id)
       .await

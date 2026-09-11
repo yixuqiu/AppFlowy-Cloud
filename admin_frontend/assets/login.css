@@ -7,11 +7,10 @@
 }
 
 #login-splash {
-  width: 100%;
   display: flex;
   align-items: center;
-  justify-content: space-evenly;
-  flex-direction: row;
+  justify-content: center;
+  flex-direction: column;
 }
 
 #login-signin {
@@ -21,6 +20,7 @@
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
 }
 
 #oauth-container {
@@ -29,6 +29,7 @@
   align-items: center;
   justify-content: center;
   width: 100%;
+  flex-wrap: wrap;
 }
 
 .oauth-icon {

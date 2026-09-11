@@ -1,9 +1,7 @@
-use collab::core::awareness::AwarenessUpdate;
-use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display, Formatter};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
 use yrs::updates::decoder::{Decode, Decoder};
 use yrs::updates::encoder::{Encode, Encoder};
 use yrs::StateVector;
@@ -23,7 +21,7 @@ pub const PERMISSION_GRANTED: u8 = 1;
 pub enum Message {
   Sync(SyncMessage),
   Auth(Option<String>),
-  Awareness(AwarenessUpdate),
+  Awareness(Vec<u8>),
   Custom(CustomMessage),
 }
 
@@ -45,7 +43,7 @@ impl Encode for Message {
       },
       Message::Awareness(update) => {
         encoder.write_var(MSG_AWARENESS);
-        encoder.write_buf(&update.encode_v1())
+        encoder.write_buf(update)
       },
       Message::Custom(msg) => {
         encoder.write_var(MSG_CUSTOM);
@@ -65,8 +63,7 @@ impl Decode for Message {
       },
       MSG_AWARENESS => {
         let data = decoder.read_buf()?;
-        let update = AwarenessUpdate::decode_v1(data)?;
-        Ok(Message::Awareness(update))
+        Ok(Message::Awareness(data.into()))
       },
       MSG_AUTH => {
         let reason = if decoder.read_var::<u8>()? == PERMISSION_DENIED {
@@ -259,7 +256,7 @@ pub enum RTProtocolError {
 
   #[error("Missing Updates")]
   MissUpdates {
-    /// - `state_vector_v1`: Contains the last known state vector from the client. If `None`,
+    /// - `state_vector_v1`: Contains the last known state vector from the Collab. If `None`,
     ///   this indicates that the receiver needs to perform a full initialization synchronization starting from sync step 0.
     ///
     /// The receiver uses this information to determine how to recover from the error,
@@ -289,7 +286,7 @@ impl<'a, D: Decoder> MessageReader<'a, D> {
   }
 }
 
-impl<'a, D: Decoder> Iterator for MessageReader<'a, D> {
+impl<D: Decoder> Iterator for MessageReader<'_, D> {
   type Item = Result<Message, yrs::encoding::read::Error>;
 
   fn next(&mut self) -> Option<Self::Item> {

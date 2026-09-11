@@ -19,7 +19,7 @@ pub struct AdminListUsersResponse {
   pub aud: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
   pub id: String,
 
@@ -72,7 +72,7 @@ pub struct Factor {
   pub factor_type: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GotrueTokenResponse {
   /// the token that clients use to make authenticated requests to the server or API. It is a bearer token that provides temporary, secure access to server resources.
   pub access_token: String,
@@ -105,7 +105,7 @@ pub struct GoTrueSettings {
   pub mailer_autoconfirm: bool,
   pub phone_autoconfirm: bool,
   pub sms_provider: String,
-  pub mfa_enabled: bool,
+  pub mfa_enabled: Option<bool>, // later version have this field removed
   pub saml_enabled: bool,
 }
 

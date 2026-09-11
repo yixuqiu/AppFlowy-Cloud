@@ -1,8 +1,8 @@
 use futures_util::{Sink, Stream, StreamExt};
-use http::HeaderMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderMap;
 use tokio_tungstenite::{
   tungstenite::{
     error::*,
@@ -152,7 +152,7 @@ impl From<Error> for crate::Error {
       Error::Utf8 => crate::Error::Utf8,
       Error::AttackAttempt => crate::Error::AttackAttempt,
       Error::Url(inner) => crate::Error::Url(inner.into()),
-      Error::Http(inner) => crate::Error::Http(inner),
+      Error::Http(inner) => crate::Error::Http(inner.into()),
       Error::HttpFormat(inner) => crate::Error::HttpFormat(inner),
     }
   }

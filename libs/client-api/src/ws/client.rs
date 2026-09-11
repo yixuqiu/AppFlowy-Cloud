@@ -1,27 +1,30 @@
-use futures_util::{SinkExt, StreamExt};
-use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Display;
-
-use futures_util::stream::{SplitSink, SplitStream};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use semver::Version;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::sync::broadcast::{channel, Receiver, Sender};
 
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
+use parking_lot::RwLock;
+// use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use semver::Version;
+use tokio::sync::broadcast::{channel, Receiver, Sender};
+use tokio::sync::oneshot;
+use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue};
+use tracing::{error, info, trace, warn};
+
+use crate::ping::ServerFixIntervalPing;
+use crate::retry::retry_connect;
 use crate::ws::msg_queue::{AggregateMessageQueue, AggregateMessagesReceiver};
 use crate::ws::{ConnectState, ConnectStateNotify, WSError, WebSocketChannel};
-use crate::ServerFixIntervalPing;
-use crate::{af_spawn, retry_connect};
 use client_websocket::{CloseCode, CloseFrame, Message, WebSocketStream};
 use collab_rt_entity::user::UserMessage;
 use collab_rt_entity::ClientCollabMessage;
 use collab_rt_entity::ServerCollabMessage;
 use collab_rt_entity::{RealtimeMessage, SystemMessage};
-use tokio::sync::{oneshot, Mutex};
-use tracing::{error, info, trace, warn};
 
 pub struct WSClientConfig {
   /// specifies the number of messages that the channel can hold at any given
@@ -91,7 +94,7 @@ impl WSClient {
     let (ws_msg_sender, _) = channel(config.buffer_capacity);
     let state_notify = Arc::new(parking_lot::Mutex::new(ConnectStateNotify::new()));
     let channels = Arc::new(RwLock::new(HashMap::new()));
-    let ping = Arc::new(Mutex::new(None));
+    let ping = Arc::new(Mutex::from(None));
     let http_sender = Arc::new(http_sender);
     let (user_channel, _) = channel(1);
     let (rt_msg_sender, _) = channel(config.buffer_capacity);
@@ -106,7 +109,7 @@ impl WSClient {
       user_channel: Arc::new(user_channel),
       channels,
       ping,
-      stop_ws_msg_loop_tx: Mutex::new(None),
+      stop_ws_msg_loop_tx: Mutex::from(None),
       aggregate_queue,
 
       #[cfg(debug_assertions)]
@@ -179,7 +182,7 @@ impl WSClient {
   fn spawn_aggregate_message(&self) {
     let mut rx = self.rt_msg_sender.subscribe();
     let weak_aggregate_queue = Arc::downgrade(&self.aggregate_queue);
-    af_spawn(async move {
+    tokio::spawn(async move {
       while let Ok(msg) = rx.recv().await {
         if let Some(aggregate_queue) = weak_aggregate_queue.upgrade() {
           aggregate_queue.push(msg).await;
@@ -228,7 +231,7 @@ impl WSClient {
       }
     };
 
-    af_spawn(async move {
+    tokio::spawn(async move {
       loop {
         tokio::select! {
            _ = &mut stop_ws_msg_loop_rx => break,
@@ -263,7 +266,7 @@ impl WSClient {
     #[cfg(debug_assertions)]
     let cloned_skip_realtime_message = self.skip_realtime_message.clone();
     let user_message_tx = self.user_channel.as_ref().clone();
-    af_spawn(async move {
+    tokio::spawn(async move {
       while let Some(Ok(ws_msg)) = stream.next().await {
         match ws_msg {
           Message::Binary(data) => {
@@ -301,7 +304,7 @@ impl WSClient {
                 RealtimeMessage::ServerCollabV1(collab_messages) => {
                   handle_collab_message(&weak_collab_channels, collab_messages);
                 },
-                RealtimeMessage::ClientCollabV1(_) | RealtimeMessage::ClientCollabV2(_) => {
+                RealtimeMessage::ClientCollabV2(_) | RealtimeMessage::ClientCollabV1(_) => {
                   // The message from server should not be collab message.
                   error!(
                     "received unexpected collab message from websocket: {:?}",
@@ -460,7 +463,7 @@ async fn send_message(
   if message.is_binary() && message.len() > MAXIMUM_MESSAGE_SIZE {
     if let Some(http_sender) = http_sender.upgrade() {
       let cloned_device_id = device_id.to_string();
-      af_spawn(async move {
+      tokio::spawn(async move {
         if let Err(err) = http_sender.send_ws_msg(&cloned_device_id, message).await {
           error!("Failed to send WebSocket message over HTTP: {}", err);
         }
@@ -492,7 +495,7 @@ impl Display for ConnectInfo {
 }
 
 impl From<ConnectInfo> for HeaderMap {
-  fn from(info: ConnectInfo) -> Self {
+  fn from(info: ConnectInfo) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
       "device-id",

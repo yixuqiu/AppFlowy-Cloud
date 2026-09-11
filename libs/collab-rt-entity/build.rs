@@ -10,24 +10,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("PROTOC", protoc_path_str);
   });
 
+  let proto_files = vec!["proto/realtime.proto", "proto/collab.proto"];
+  for proto_file in &proto_files {
+    println!("cargo:rerun-if-changed={}", proto_file);
+  }
+
   prost_build::Config::new()
     .out_dir("src/")
-    .compile_protos(&["proto/realtime.proto"], &["proto/"])?;
+    .compile_protos(&proto_files, &["proto/"])?;
 
-  // Run rustfmt on the generated files.
-  let files = std::fs::read_dir("src/")?
-    .filter_map(Result::ok)
-    .filter(|entry| {
-      entry
-        .path()
-        .extension()
-        .map(|ext| ext == "rs")
-        .unwrap_or(false)
-    })
-    .map(|entry| entry.path().display().to_string());
-
-  for file in files {
-    Command::new("rustfmt").arg(file).status()?;
-  }
+  // Run cargo fmt to format the code
+  Command::new("cargo").arg("fmt").status()?;
   Ok(())
 }

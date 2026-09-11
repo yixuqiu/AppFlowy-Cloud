@@ -1,8 +1,10 @@
-use client_api_test_util::TestClient;
-use collab_entity::CollabType;
-use database_entity::dto::{AFAccessLevel, AFRole};
 use std::time::Duration;
+
+use client_api_test::TestClient;
+use collab_entity::CollabType;
+use database_entity::dto::AFRole;
 use tokio::time::sleep;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn viewing_document_editing_users_test() {
@@ -17,26 +19,19 @@ async fn viewing_document_editing_users_test() {
     .unwrap();
 
   let object_id = owner
-    .create_and_edit_collab(&workspace_id, collab_type.clone())
+    .create_and_edit_collab(workspace_id, collab_type)
     .await;
 
   let owner_uid = owner.uid().await;
   let clients = owner.get_connect_users(&object_id).await;
-  assert_eq!(clients.len(), 1);
+  assert_eq!(clients.len(), 1, "guest shouldn't be connected yet");
   assert_eq!(clients[0], owner_uid);
 
-  owner
-    .add_collab_member(
-      &workspace_id,
-      &object_id,
-      &guest,
-      AFAccessLevel::ReadAndWrite,
-    )
-    .await;
   guest
-    .open_collab(&workspace_id, &object_id, collab_type)
+    .open_collab(workspace_id, object_id, collab_type)
     .await;
   guest.wait_object_sync_complete(&object_id).await.unwrap();
+  sleep(Duration::from_secs(1)).await;
 
   // after guest open the collab, it will emit an awareness that contains the user id of guest.
   // This awareness will be sent to the server. Server will broadcast the awareness to all the clients
@@ -48,19 +43,19 @@ async fn viewing_document_editing_users_test() {
   let mut expected_clients = [owner_uid, guest_uid];
   expected_clients.sort();
 
-  assert_eq!(clients.len(), 2);
+  assert_eq!(clients.len(), 2, "expected owner and member connected");
   assert_eq!(clients, expected_clients);
   // simulate the guest close the collab
-  guest.clean_awareness_state(&object_id);
+  guest.clean_awareness_state(&object_id).await;
   // sleep 5 second to make sure the awareness observe callback is called
   sleep(Duration::from_secs(5)).await;
   guest.wait_object_sync_complete(&object_id).await.unwrap();
   let clients = owner.get_connect_users(&object_id).await;
-  assert_eq!(clients.len(), 1);
+  assert_eq!(clients.len(), 1, "expected only owner connected");
   assert_eq!(clients[0], owner_uid);
 
   // simulate the guest open the collab again
-  guest.emit_awareness_state(&object_id);
+  guest.emit_awareness_state(&object_id).await;
   // sleep 2 second to make sure the awareness observe callback is called
   sleep(Duration::from_secs(2)).await;
   guest.wait_object_sync_complete(&object_id).await.unwrap();
@@ -70,7 +65,7 @@ async fn viewing_document_editing_users_test() {
 
 async fn assert_num_connected_client_within_secs(
   client: &TestClient,
-  object_id: &str,
+  object_id: &Uuid,
   expected: usize,
   secs: u64,
 ) {

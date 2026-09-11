@@ -1,27 +1,26 @@
-use crate::af_spawn;
-use crate::collab_sync::collab_stream::ObserveCollab;
+use std::fmt::Display;
+use std::ops::Deref;
+use std::sync::Arc;
+use std::time::Duration;
+
+use collab::core::awareness::Awareness;
+use collab::core::origin::CollabOrigin;
+use collab::preclude::Collab;
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{broadcast, watch};
+use tracing::{error, info, instrument, trace};
+use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
+use yrs::{ReadTxn, StateVector};
+
+use collab_rt_entity::{ClientCollabMessage, InitSync, ServerCollabMessage, UpdateSync};
+use collab_rt_protocol::{ClientSyncProtocol, CollabSyncProtocol, Message, SyncMessage};
+
+use crate::collab_sync::collab_stream::{CollabRef, ObserveCollab};
 use crate::collab_sync::{
   CollabSink, CollabSinkRunner, CollabSyncState, MissUpdateReason, SinkSignal, SyncError,
   SyncObject,
 };
-
-use collab::core::awareness::Awareness;
-use collab::core::collab::MutexCollab;
-use collab::core::origin::CollabOrigin;
-use collab::preclude::Collab;
-use collab_rt_entity::{ClientCollabMessage, InitSync, ServerCollabMessage, UpdateSync};
-use collab_rt_protocol::{ClientSyncProtocol, CollabSyncProtocol, Message, SyncMessage};
-use futures_util::{SinkExt, StreamExt};
-use std::fmt::Display;
-use std::ops::Deref;
-use std::sync::{Arc, Weak};
-use std::time::Duration;
-use tokio::sync::{broadcast, watch};
-
-use tracing::{instrument, trace};
-use yrs::updates::decoder::Decode;
-use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-use yrs::{ReadTxn, StateVector};
 
 pub const DEFAULT_SYNC_TIMEOUT: u64 = 10;
 
@@ -59,9 +58,9 @@ where
     sink: Sink,
     sink_config: SinkConfig,
     stream: Stream,
-    collab: Weak<MutexCollab>,
+    collab: CollabRef,
+    periodic_sync: Option<Duration>,
   ) -> Self {
-    let protocol = ClientSyncProtocol;
     let (notifier, notifier_rx) = watch::channel(SinkSignal::Proceed);
     let (sync_state_tx, _) = broadcast::channel(10);
     debug_assert!(origin.client_user_id().is_some());
@@ -75,17 +74,16 @@ where
       sync_state_tx.clone(),
       sink_config,
     ));
-    af_spawn(CollabSinkRunner::run(Arc::downgrade(&sink), notifier_rx));
+    tokio::spawn(CollabSinkRunner::run(Arc::downgrade(&sink), notifier_rx));
 
     // Create the observe collab stream.
-    let _cloned_protocol = protocol.clone();
-    let _object_id = object.object_id.clone();
     let stream = ObserveCollab::new(
       origin.clone(),
       object.clone(),
       stream,
       collab.clone(),
       Arc::downgrade(&sink),
+      periodic_sync,
     );
 
     Self {
@@ -98,16 +96,12 @@ where
   }
 
   pub fn pause(&self) {
-    if cfg!(feature = "sync_verbose_log") {
-      trace!("pause {} sync", self.object.object_id);
-    }
+    info!("pause {} sync", self.object.object_id);
     self.sink.pause();
   }
 
   pub fn resume(&self) {
-    if cfg!(feature = "sync_verbose_log") {
-      trace!("resume {} sync", self.object.object_id);
-    }
+    info!("resume {} sync", self.object.object_id);
     self.sink.resume();
   }
 
@@ -116,7 +110,11 @@ where
   }
 
   /// Returns bool indicating whether the init sync is queued.
-  pub fn init_sync(&self, collab: &Collab, reason: SyncReason) -> Result<bool, SyncError> {
+  pub fn init_sync(
+    &self,
+    collab: &collab::preclude::Collab,
+    reason: SyncReason,
+  ) -> Result<bool, SyncError> {
     start_sync(
       self.origin.clone(),
       &self.object,
@@ -129,8 +127,11 @@ where
 
 pub enum SyncReason {
   CollabInitialize,
-  MissUpdates {
-    state_vector_v1: Option<Vec<u8>>,
+  ServerMissUpdates {
+    state_vector_v1: Vec<u8>,
+    reason: MissUpdateReason,
+  },
+  ClientMissUpdates {
     reason: MissUpdateReason,
   },
   ServerCannotApplyUpdate,
@@ -141,7 +142,8 @@ impl Display for SyncReason {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       SyncReason::CollabInitialize => write!(f, "CollabInitialize"),
-      SyncReason::MissUpdates { reason, .. } => write!(f, "MissUpdates: {}", reason),
+      SyncReason::ServerMissUpdates { reason, .. } => write!(f, "ServerMissUpdates: {}", reason),
+      SyncReason::ClientMissUpdates { reason } => write!(f, "ClientMissUpdates: {}", reason),
       SyncReason::ServerCannotApplyUpdate => write!(f, "ServerCannotApplyUpdate"),
       SyncReason::NetworkResume => write!(f, "NetworkResume"),
     }
@@ -151,10 +153,9 @@ impl Display for SyncReason {
 fn gen_sync_state<P: CollabSyncProtocol>(
   awareness: &Awareness,
   protocol: &P,
-  sync_before: bool,
 ) -> Result<Vec<u8>, SyncError> {
   let mut encoder = EncoderV1::new();
-  protocol.start(awareness, &mut encoder, sync_before)?;
+  protocol.start(awareness, &mut encoder)?;
   Ok(encoder.to_vec())
 }
 
@@ -181,77 +182,70 @@ where
   E: Into<anyhow::Error> + Send + Sync + 'static,
   Sink: SinkExt<Vec<ClientCollabMessage>, Error = E> + Send + Sync + Unpin + 'static,
 {
-  if !sink.should_queue_init_sync() {
-    return Ok(false);
-  }
-
   if let Err(err) = sync_object.collab_type.validate_require_data(collab) {
-    #[cfg(feature = "sync_verbose_log")]
-    trace!("{} error: {}", sync_object.object_id, err);
-    return Err(SyncError::Internal(err));
+    return Err(SyncError::Internal(err.into()));
   }
 
-  let sync_before = collab.get_last_sync_at() > 0;
   match reason {
-    SyncReason::MissUpdates {
+    SyncReason::ClientMissUpdates { reason } => {
+      if !sink.should_queue_init_sync() {
+        return Ok(false);
+      }
+
+      tracing::debug!(
+        "🔥{} restart sync due to missing update, reason:{}",
+        &sync_object.object_id,
+        reason
+      );
+      let awareness = collab.get_awareness();
+      let payload = gen_sync_state(awareness, &ClientSyncProtocol)?;
+      sink.queue_init_sync(|msg_id| {
+        let init_sync = InitSync::new(
+          origin,
+          sync_object.object_id.to_string(),
+          sync_object.collab_type,
+          sync_object.workspace_id.to_string(),
+          msg_id,
+          payload,
+        );
+        ClientCollabMessage::new_init_sync(init_sync)
+      });
+    },
+    SyncReason::ServerMissUpdates {
       state_vector_v1,
       reason,
-    } => match state_vector_v1.and_then(|sv| StateVector::decode_v1(&sv).ok()) {
-      None => {
-        trace!(
-          "🔥{} start init sync, reason:{}",
-          &sync_object.object_id,
-          reason
-        );
-        let awareness = collab.get_awareness();
-        let payload = gen_sync_state(awareness, &ClientSyncProtocol, sync_before)?;
-        sink.queue_init_sync(|msg_id| {
-          let init_sync = InitSync::new(
-            origin,
-            sync_object.object_id.clone(),
-            sync_object.collab_type.clone(),
-            sync_object.workspace_id.clone(),
-            msg_id,
-            payload,
-          );
-          ClientCollabMessage::new_init_sync(init_sync)
-        });
-      },
-      Some(sv) => {
-        trace!(
-          "🔥{} start init sync, reason:{}",
-          &sync_object.object_id,
-          reason
-        );
+    } => match StateVector::decode_v1(&state_vector_v1) {
+      Ok(sv) => {
+        trace!("🔥{} start sync, reason:{}", &sync_object.object_id, reason);
         let update = gen_missing_updates(collab, sv)?;
         sink.queue_msg(|msg_id| {
           let update_sync = UpdateSync::new(
             origin.clone(),
-            sync_object.object_id.clone(),
+            sync_object.object_id.to_string(),
             update,
             msg_id,
           );
           ClientCollabMessage::new_update_sync(update_sync)
         });
       },
+      Err(err) => error!("fail to decode server state vector: {}", err),
     },
     SyncReason::CollabInitialize
     | SyncReason::ServerCannotApplyUpdate
     | SyncReason::NetworkResume => {
-      trace!(
-        "🔥{} start init sync, reason: {}",
+      tracing::debug!(
+        "🔥{} resume network, reason: {}",
         &sync_object.object_id,
         reason
       );
       let awareness = collab.get_awareness();
-      let payload = gen_sync_state(awareness, &ClientSyncProtocol, sync_before)?;
-
+      let payload = gen_sync_state(awareness, &ClientSyncProtocol)?;
       sink.queue_init_sync(|msg_id| {
         let init_sync = InitSync::new(
           origin,
-          sync_object.object_id.clone(),
-          sync_object.collab_type.clone(),
-          sync_object.workspace_id.clone(),
+          sync_object.object_id.to_string(),
+          sync_object.collab_type,
+          sync_object.workspace_id.to_string(),
           msg_id,
           payload,
         );

@@ -21,16 +21,15 @@ impl WorkspaceViewBuilder {
     }
   }
 
-  pub async fn with_view_builder<F, O>(&mut self, view_builder: F) -> String
+  pub async fn with_view_builder<F, O>(&mut self, view_builder: F) -> &mut Self
   where
     F: Fn(ViewBuilder) -> O,
     O: Future<Output = ParentChildViews>,
   {
     let builder = ViewBuilder::new(self.uid, self.workspace_id.clone());
     let view = view_builder(builder).await;
-    let view_id = view.parent_view.id.clone();
     self.views.push(view);
-    view_id
+    self
   }
 
   pub fn build(&mut self) -> Vec<ParentChildViews> {
@@ -45,11 +44,11 @@ pub struct ViewBuilder {
   parent_view_id: String,
   view_id: String,
   name: String,
-  desc: String,
   layout: ViewLayout,
   child_views: Vec<ParentChildViews>,
   is_favorite: bool,
   icon: Option<ViewIcon>,
+  extra: Option<String>,
 }
 
 impl ViewBuilder {
@@ -59,16 +58,21 @@ impl ViewBuilder {
       parent_view_id,
       view_id: gen_view_id().to_string(),
       name: Default::default(),
-      desc: Default::default(),
       layout: ViewLayout::Document,
       child_views: vec![],
       is_favorite: false,
       icon: None,
+      extra: None,
     }
   }
 
   pub fn view_id(&self) -> &str {
     &self.view_id
+  }
+
+  pub fn with_view_id<T: ToString>(mut self, view_id: T) -> Self {
+    self.view_id = view_id.to_string();
+    self
   }
 
   pub fn with_layout(mut self, layout: ViewLayout) -> Self {
@@ -81,16 +85,16 @@ impl ViewBuilder {
     self
   }
 
-  pub fn with_desc(mut self, desc: &str) -> Self {
-    self.desc = desc.to_string();
-    self
-  }
-
   pub fn with_icon(mut self, icon: &str) -> Self {
     self.icon = Some(ViewIcon {
       ty: IconType::Emoji,
       value: icon.to_string(),
     });
+    self
+  }
+
+  pub fn with_extra(mut self, extra: &str) -> Self {
+    self.extra = Some(extra.to_string());
     self
   }
 
@@ -111,7 +115,6 @@ impl ViewBuilder {
       id: self.view_id,
       parent_view_id: self.parent_view_id,
       name: self.name,
-      desc: self.desc,
       created_at: timestamp(),
       is_favorite: self.is_favorite,
       layout: self.layout,
@@ -128,7 +131,8 @@ impl ViewBuilder {
           .collect(),
       ),
       last_edited_by: Some(self.uid),
-      extra: None,
+      is_locked: None,
+      extra: self.extra,
     };
     ParentChildViews {
       parent_view: view,

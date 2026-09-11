@@ -6,8 +6,8 @@
 
 <!-- prettier-ignore -->
 {% block head %}
-<link href="/assets/login.css" rel="stylesheet" />
-<link href="/assets/google/logo.css" rel="stylesheet" />
+<link href="../assets/login.css" rel="stylesheet" />
+<link href="../assets/google/logo.css" rel="stylesheet" />
 {% endblock %}
 
 <!-- prettier-ignore -->
@@ -16,12 +16,16 @@
   <div id="login-signin">
     <div id="login-splash">
       {% include "../assets/logo.html" %}
-      <h2>AppFlowy Cloud</h2>
+      <h2 style="padding: 16px">AppFlowy Cloud</h2>
     </div>
 
     <h3>Email Login</h3>
     <form>
       <table style="width: 100%">
+        {% if let Some(redirect_to) = redirect_to %}
+        <input type="hidden" name="redirect_to" value="{{ redirect_to }}" />
+        {% endif %}
+
         <tr>
           <td>Email</td>
           <td>
@@ -57,7 +61,7 @@
       >
       <div style="display: flex; margin: 8px 0px">
         <button
-          hx-post="/web-api/signin"
+          hx-post="../web-api/signin"
           hx-target="#none"
           class="button cyan"
           type="submit"
@@ -66,11 +70,11 @@
           Sign In
         </button>
         <button
-          hx-post="/web-api/signup"
+          hx-post="../web-api/signup"
           hx-target="#none"
           class="button purple"
           type="submit"
-          style="width: 100%; padding: 8px 8px"
+          style="width: 100%; padding: 8px 8px; color: white"
         >
           Sign Up
         </button>
@@ -80,73 +84,82 @@
     <!-- Load OAuth Providers if configured -->
     {% if oauth_providers.len() > 0 %}
     <br />
-    <table style="width: 100%">
-      <tr style="display: flex">
-        <td style="width: 100%; margin: auto"><hr /></td>
+    <table style="width: 100%; border-collapse: collapse">
+      <tr style="display: flex; align-items: center">
+        <td style="width: 100%; margin: auto">
+          <hr class="divider" />
+        </td>
         <td style="flex: 1; text-align: center">&nbsp;or&nbsp;</td>
-        <td style="width: 100%; margin: auto"><hr /></td>
+        <td style="width: 100%; margin: auto">
+          <hr class="divider" />
+        </td>
       </tr>
     </table>
 
     <h3>OAuth Login</h3>
     <div id="oauth-container">
-      {% for provider in oauth_providers %}
-      <div class="oauth-icon">
+      <div
+        style="
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          justify-content: center;
+        "
+      >
+        {% for provider in oauth_providers %}
         <a
-          href="/gotrue/authorize?provider={{ provider|escape }}&redirect_to=/web/login"
+          href="/gotrue/authorize?provider={{ provider|escape }}&redirect_to={{ oauth_redirect_to|escape }}"
+          style="text-decoration: none; color: inherit"
         >
           <div
-            hx-get="../assets/{{ provider|escape }}/logo.html"
-            hx-trigger="load"
-            hx-swap="outerHTML"
-          ></div>
+            style="
+              display: flex;
+              align-items: center;
+              border: 1px solid #384967;
+              margin: 4px;
+              border-radius: 4px;
+              height: 64px;
+            "
+          >
+            <div>&nbsp&nbsp{{ provider }}</div>
+            <div class="oauth-icon">
+              <div
+                hx-get="../assets/{{ provider|escape }}/logo.html"
+                hx-trigger="load"
+                hx-swap="outerHTML"
+              ></div>
+            </div>
+          </div>
         </a>
+        {% endfor %}
       </div>
-      {% endfor %} {% endif %}
+    </div>
+    {% endif %}
+
+    <span> &nbsp </span>
+    <div style="max-width: 256px; display: flex; align-items: center">
+      <img
+        src="https://cdn.prod.website-files.com/5c14e387dab576fe667689cf/61e1116779fc0a9bd5bdbcc7_Frame%206.png"
+        alt="kofi"
+        width="32"
+        height="32"
+      />
+      <i>
+        &nbsp Support AppFlowy on <a href="https://ko-fi.com/appflowy">Ko-fi</a>
+      </i>
+    </div>
+
+    <span> &nbsp </span>
+    <div style="max-width: 256px">
+      <small style="color: #888; text-align: center"
+        ><i>
+          &nbsp By clicking logging in or signing up, you confirm that you have
+          read, understood, and agreed to AppFlowy's
+          <a href="https://appflowy.io/terms">Terms</a> and
+          <a href="https://appflowy.io/privacy">Privacy Policy</a>.
+        </i></small
+      >
     </div>
   </div>
-
-  <script>
-    // OAuthLogin (This is done because axum doesn't support fragment in the URL)
-    // https://github.com/tokio-rs/axum/discussions/2147
-
-    // Parse the fragment and extract the parameters
-    const paramMap = {};
-    if (window.location.hash) {
-      const fragments = window.location.href.split('#').slice(1);
-      for (let i = 0; i < fragments.length; i++) {
-        const params = fragments[i].split('&');
-        for (let j = 0; j < params.length; j++) {
-          const keyValue = params[j].split('=');
-          if (keyValue.length === 2) {
-            const key = keyValue[0];
-            const value = keyValue[1];
-            paramMap[key] = value;
-          }
-        }
-      }
-
-      // Clear the fragment from the URL
-      history.replaceState("", document.title, window.location.pathname + window.location.search);
-
-      // Login in via refresh_token
-      const refreshToken = paramMap['refresh_token'];
-      fetch(`/web-api/login-refresh/${refreshToken}`, {
-        method: "POST",
-      }).then((response) => {
-        if (!response.ok) {
-          displayHttpStatusAndPayload(response);
-        } else {
-          const redirect_to = paramMap['redirect_to'];
-          if (redirect_to && redirect_to.trim() !== "") {
-            console.log("redirect_to is not empty");
-            window.location.href = "/web/home#" + redirect_to;
-          } else {
-            window.location.href = "/web/home";
-          }
-        }
-      });
-    }
-  </script>
   {% endblock %}
 </div>

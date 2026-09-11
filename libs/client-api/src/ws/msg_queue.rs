@@ -1,12 +1,15 @@
-use client_websocket::Message;
-use collab_rt_entity::RealtimeMessage;
-use collab_rt_entity::{ClientCollabMessage, MsgId};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::time::{sleep_until, Instant};
 use tracing::{error, trace};
+
+use client_websocket::Message;
+use collab_rt_entity::{ClientCollabMessage, MsgId};
+use collab_rt_entity::{MessageByObjectId, RealtimeMessage};
 
 pub type AggregateMessagesSender = mpsc::Sender<Message>;
 pub type AggregateMessagesReceiver = mpsc::Receiver<Message>;
@@ -112,7 +115,7 @@ async fn send_batch_message(
   sender: &AggregateMessagesSender,
   messages_map: HashMap<String, Vec<ClientCollabMessage>>,
 ) {
-  match RealtimeMessage::ClientCollabV2(messages_map).encode() {
+  match RealtimeMessage::ClientCollabV2(MessageByObjectId(messages_map)).encode() {
     Ok(data) => {
       if let Err(e) = sender.send(Message::Binary(data)).await {
         trace!("websocket channel close:{}, stop sending messages", e);
@@ -227,9 +230,9 @@ fn calculate_next_tick_duration(
     Duration::from_secs(1)
   } else {
     match num_init_sync {
-      0..=3 => default_interval,
-      4..=7 => Duration::from_secs(4),
-      _ => Duration::from_secs(6),
+      0..=10 => default_interval,
+      11..=20 => Duration::from_secs(2),
+      _ => Duration::from_secs(4),
     }
   }
 }

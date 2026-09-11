@@ -5,20 +5,8 @@ import "google/protobuf/wrappers.proto";
 // For optional string support
 package history;
 
-service History {
-    rpc GetSnapshots (SnapshotRequest) returns (RepeatedSnapshotMeta);
-    rpc GetInMemoryHistory (SnapshotRequest) returns (HistoryState);
-    rpc GetInDiskHistory (SnapshotMeta) returns (HistoryState);
-}
-
-message SnapshotRequest {
-    string workspace_id = 1;
-    string object_id = 2;
-    int32 collab_type = 3;
-}
-
-// SnapshotMeta represents metadata for a snapshot.
-message SnapshotMeta {
+// SnapshotMetaPB represents metadata for a snapshot.
+message SnapshotMetaPb {
     // The unique identifier for the snapshot.
     string oid = 1;
     // The raw binary snapshot data.
@@ -31,26 +19,12 @@ message SnapshotMeta {
     int64 created_at = 4;
 }
 
-// A container for repeated instances of SnapshotMeta.
-message RepeatedSnapshotMeta {
-    repeated SnapshotMeta items = 1;  // List of SnapshotMeta items
+message SingleSnapshotInfoPb {
+    HistoryStatePb history_state = 1;
+    SnapshotMetaPb snapshot_meta = 2;
 }
 
-
-// SnapshotState represents the state of a snapshot, including optional dependency IDs.
-message SnapshotState {
-    string oid = 1;                        // Unique identifier for the snapshot
-    bytes doc_state = 2;                   // The document state as raw binary data
-    int32 doc_state_version = 3;           // Version of the document state format
-    google.protobuf.StringValue deps_snapshot_id = 4; // Optional dependency snapshot ID
-}
-
-message SnapshotInfo {
-    HistoryState history_state = 1;
-    bytes snapshot = 2;  // Additional field specific to SnapshotInfo representing the snapshot data
-}
-
-message HistoryState {
+message HistoryStatePb {
     string object_id = 1;                  // Unique identifier for the object
     bytes doc_state = 2;                   // The document state as raw binary data
     int32 doc_state_version = 3;           // Version of the document state format, with decoding instructions based on version

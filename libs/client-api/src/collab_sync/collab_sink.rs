@@ -1,26 +1,26 @@
-use crate::af_spawn;
-use crate::collab_sync::collab_stream::SeqNumCounter;
-
-use crate::collab_sync::{SinkConfig, SyncError, SyncObject};
-use anyhow::Error;
-use collab::core::origin::{CollabClient, CollabOrigin};
-use collab_rt_entity::{ClientCollabMessage, MsgId, ServerCollabMessage, SinkMessage};
-use futures_util::SinkExt;
 use std::collections::BinaryHeap;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, watch, Mutex};
+
+use anyhow::Error;
+use collab::core::origin::{CollabClient, CollabOrigin};
+use collab::lock::Mutex;
+use futures_util::SinkExt;
+use tokio::sync::{broadcast, watch};
 use tokio::time::{interval, sleep};
 use tracing::{error, trace, warn};
+
+use crate::collab_sync::collab_stream::SeqNumCounter;
+use crate::collab_sync::{SinkConfig, SyncError, SyncObject};
+use collab_rt_entity::{ClientCollabMessage, MsgId, ServerCollabMessage, SinkMessage};
 
 pub(crate) const SEND_INTERVAL: Duration = Duration::from_secs(8);
 pub const COLLAB_SINK_DELAY_MILLIS: u64 = 500;
 
 pub struct CollabSink<Sink> {
-  #[allow(dead_code)]
   uid: i64,
   config: SinkConfig,
   object: SyncObject,
@@ -63,7 +63,7 @@ where
     config: SinkConfig,
   ) -> Self {
     let notifier = Arc::new(notifier);
-    let sender = Arc::new(Mutex::new(sink));
+    let sender = Arc::new(Mutex::from(sink));
     let message_queue = Arc::new(parking_lot::Mutex::new(SinkQueue::new()));
     let sending_messages = Arc::new(parking_lot::Mutex::new(HashSet::new()));
     let state = Arc::new(CollabSinkState::new());
@@ -78,7 +78,7 @@ where
 
     let cloned_state = state.clone();
     let weak_notifier = Arc::downgrade(&notifier);
-    af_spawn(async move {
+    tokio::spawn(async move {
       // Initial delay to make sure the first tick waits for SEND_INTERVAL
       sleep(SEND_INTERVAL).await;
       loop {
@@ -172,18 +172,8 @@ where
   }
 
   pub fn clear(&self) {
-    match self.message_queue.try_lock() {
-      None => error!("failed to acquire the lock of the sink"),
-      Some(mut msg_queue) => {
-        msg_queue.clear();
-      },
-    }
-    match self.sending_messages.try_lock() {
-      None => error!("failed to acquire the lock of the flying message"),
-      Some(mut sending_messages) => {
-        sending_messages.clear();
-      },
-    }
+    self.message_queue.lock().clear();
+    self.sending_messages.lock().clear();
   }
 
   pub fn pause(&self) {
@@ -216,6 +206,14 @@ where
 
     // if the message id is not in the sending messages, it means the message is invalid.
     if !sending_messages.contains(&income_message_id) {
+      if cfg!(feature = "sync_verbose_log") {
+        trace!(
+          "{}: sending messages:{:?} not contains {}",
+          self.object.object_id,
+          sending_messages,
+          income_message_id
+        );
+      }
       return Ok(false);
     }
 
@@ -245,7 +243,6 @@ where
         }
       }
     }
-
     // Check if all non-ping messages have been sent
     let all_non_ping_messages_sent = !message_queue
       .iter()
@@ -276,6 +273,15 @@ where
   }
 
   async fn process_next_msg(&self) {
+    let is_empty_queue = self
+      .message_queue
+      .try_lock()
+      .map(|q| q.is_empty())
+      .unwrap_or(true);
+    if is_empty_queue {
+      return;
+    }
+
     let items = {
       let (mut msg_queue, mut sending_messages) = match (
         self.message_queue.try_lock(),
@@ -283,13 +289,10 @@ where
       ) {
         (Some(msg_queue), Some(sending_messages)) => (msg_queue, sending_messages),
         _ => {
-          // If acquire the lock failed, try later
-          if cfg!(feature = "sync_verbose_log") {
-            trace!(
-              "{}: failed to acquire the lock of the sink, retry later",
-              self.object.object_id
-            );
-          }
+          warn!(
+            "{}: failed to acquire the lock of the sink, retry later",
+            self.object.object_id
+          );
           retry_later(Arc::downgrade(&self.notifier));
           return;
         },
@@ -359,14 +362,15 @@ where
 
         // Try to merge the next message with the last message. Only merge when:
         // 1. The last message is not in the flying messages.
-        // 2. The last message can be merged.
+        // 2. The last message can be merged and the next message can be merged.
         // 3. The last message's payload size is less than the maximum payload size.
         if let Some(last) = items.last_mut() {
-          if !sending_messages.contains(&last.msg_id())
+          let can_merge = !sending_messages.contains(&last.msg_id())
             && last.message().payload_size() < self.config.maximum_payload_size
             && last.mergeable()
-            && last.merge(&next, &self.config.maximum_payload_size).is_ok()
-          {
+            && next.mergeable()
+            && last.merge(&next, &self.config.maximum_payload_size).is_ok();
+          if can_merge {
             merged_ids
               .entry(last.msg_id())
               .or_insert(vec![])
@@ -515,7 +519,7 @@ impl SyncTimestamp {
   fn new() -> Self {
     let now = Instant::now();
     SyncTimestamp {
-      last_sync: Mutex::new(now.checked_sub(Duration::from_secs(60)).unwrap_or(now)),
+      last_sync: Mutex::from(now.checked_sub(Duration::from_secs(60)).unwrap_or(now)),
     }
   }
 

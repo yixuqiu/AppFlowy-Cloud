@@ -1,10 +1,12 @@
+mod ai_test;
 mod collab;
-mod collab_snapshot;
+mod collab_history;
+mod file_test;
 mod gotrue;
+mod search;
+mod server_info;
 mod sql_test;
 mod user;
 mod websocket;
 mod workspace;
-
-mod ai_test;
 mod yrs_version;

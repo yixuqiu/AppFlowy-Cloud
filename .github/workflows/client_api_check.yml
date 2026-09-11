@@ -25,15 +25,16 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack
 
+      - name: install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install protobuf-compiler
+
       - name: Build ClientAPI
         working-directory: ./libs/client-api
         run: cargo build --features "enable_brotli"
 
-      - name: Build ClientAPI WASM
-        working-directory: ./libs/client-api
-        run: wasm-pack build
-
       - name: Check ClientAPI Dependencies
         working-directory: ./libs/client-api
-        run: bash ../../build/client_api_deps_check.sh
+        run: bash ../../script/client_api_deps_check.sh
 

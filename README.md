@@ -1,121 +1,86 @@
 <p align="center">
-  <img src="assets/logos/appflowy_logo.svg"  width="500" height="200" />
+    <picture>
+        <source srcset="assets/logos/appflowy_logo_white.svg" media="(prefers-color-scheme: dark)"/>
+        <img src="assets/logos/appflowy_logo_black.svg"  width="500" height="200" />
+    </picture>
 </p>
 
 <h4 align="center">
-   <a href="https://discord.gg/9Q2xaN37tV"><img src="https://img.shields.io/badge/AppFlowy.IO-discord-orange"></a>
+    <a href="https://discord.gg/9Q2xaN37tV"><img src="https://img.shields.io/badge/AppFlowy.IO-discord-orange"></a>
     <a href="https://opensource.org/licenses/AGPL-3.0"><img src="https://img.shields.io/badge/license-AGPL-purple.svg" alt="License: AGPL"></a>
 </h4>
 
-
 <p align="center">
-    <a href="https://www.appflowy.io"><b>Website</b></a> •
+    <a href="https://www.appflowy.com"><b>Website</b></a> •
     <a href="https://twitter.com/appflowy"><b>Twitter</b></a>
 </p>
 
 <p align="center">⚡ The AppFlowy Cloud written with Rust 🦀</p>
 
+# Switch to the AppFlowy-SelfHost-Commercial repo
+
+This repository is archived and is no longer used to build or distribute the latest AppFlowy self-hosted server.
+
+For all self-hosted deployments and upgrades, please use the [AppFlowy-SelfHost-Commercial](https://github.com/AppFlowy-IO/AppFlowy-SelfHost-Commercial) repository. It contains the latest Docker Compose configuration for self-hosting AppFlowy.
+
+The [official Docker images](https://hub.docker.com/r/appflowyinc/appflowy_cloud/tags) are built from AppFlowy's actively maintained commercial server codebase and include the latest features, improvements, and fixes.
+
+> **Important:** Do not build the server from this archived `appflowy-cloud` repository. New server features are only available in the [official prebuilt Docker images](https://hub.docker.com/r/appflowyinc/appflowy_cloud/tags). Newer versions of the AppFlowy web and client apps also depend on these server updates, so using a server built from this repository may result in missing or incompatible features.
+
+To deploy the latest self-hosted version:
+
+```bash
+git clone https://github.com/AppFlowy-IO/AppFlowy-SelfHost-Commercial
+cd AppFlowy-SelfHost-Commercial
+cp deploy.env .env
+docker compose up -d
+```
+
 # AppFlowy Cloud
 
-AppFlowy Cloud is part of the AppFlowy ecosystem, offering secure user authentication, file storage,
-and real-time WebSocket communication for an efficient and collaborative user experience.
+AppFlowy Cloud operates on an open-core model to ensure the project's long-term sustainability. This legacy repository ([link](https://github.com/AppFlowy-IO/AppFlowy-Cloud)) is no longer maintained or in use across any AppFlowy product offerings, including our current SaaS and self-hosted solutions.
 
-## Table of Contents
-- [🚀 Deployment](#-deployment)
-- [💻 Development](#-development)
-- [🐞 Debugging](#-debugging)
-- [⚙️ Contributing](#-contributing)
+For active deployments, AppFlowy offers two production-grade options driven by our [commercial AppFlowy Cloud codebase](https://github.com/AppFlowy-IO/AppFlowy-selfhost-commercial)—a closed-source fork of this open-source core combined with proprietary features: 
 
+* **AppFlowy Managed Cloud (SaaS):** AWS-hosted instances fully deployed and managed by the AppFlowy team.
+* **AppFlowy Self-hosted Cloud:** Configurable services deployed directly on your own infrastructure, engineered for teams and enterprises requiring full data sovereignty and modular components tailored to their own infrastructure needs.
+
+### AppFlowy Self-Hosted Cloud (Free Tier)
+Our commercial self-hosted distribution comes with a robust Free tier, specifically designed for experienced IT professionals and self-hosting enthusiasts to test and deploy our solution. 
+
+The Free Tier allows seamless, in-place upgrades to higher enterprise tiers and offers:
+* One User Seat (per instance)
+* AppFlowy Web App access (via your hosted domain, e.g., `https://appflowy.com`)
+* Up to 3 Guest Editors who can be added to selected pages to collaborate in real-time with granular permissions (Can View / Comment / Edit)
+* Publish Pages functionality
+* Unlimited Workspaces
+
+For detailed commercial pricing and tier features, please visit our [Self-hosted Plans and Pricing Page](https://appflowy.com/docs/Self-hosted-Plans-and-Pricing), your self-hosted admin panel, or our official [Pricing Website](https://appflowy.com/pricing). We care deeply about our self-hosted community; commercial self-hosting is a vital strategic pillar that directly funds and sustains the continuous development of AppFlowy's core open-source projects.
+
+### Open Source vs. Open Core
+AppFlowy Cloud adopts an open-core model, while AppFlowy Web and AppFlowy Flutter remain entirely open source. As part of this transition, we are consolidating and reorganizing our active codebases within private repositories. 
+
+Recently, we merged all active AppFlowy Web–related development from our private repository back into our public ecosystem; please see our [Web Commit History](https://github.com/AppFlowy-IO/AppFlowy-Web/commits/main/) for engineering reference. We will also merge active Flutter code bases back into the public [AppFlowy Repository](https://github.com/AppFlowy-IO/AppFlowy) at a later stage.
+
+AppFlowy Cloud will continue to follow the open-core model for commercial sustainability. You are free to utilize the legacy code inside `https://github.com/AppFlowy-IO/AppFlowy-Cloud` governed by its original license. Please remain aware that we no longer support, update, or maintain this specific repository.
+
+We also continue to actively develop other open-source repositories, including:
+* [AppFlowy Website](https://github.com/AppFlowy-IO/AppFlowy-Website) - For developers looking to construct custom web structures following our navigation model.
+* [appflowy-editor](https://github.com/AppFlowy-IO/appflowy-editor) - A highly customizable element editor for Flutter developers.
+* [appflowy-board](https://github.com/AppFlowy-IO/appflowy-board) - Modular board layout tools built for Flutter environments.
+
+---
 
 ## 🚀 Deployment
-- See [deployment guide](./doc/DEPLOYMENT.md)
 
-## 💻 Development
+Please review our comprehensive [Step-by-Step Self-Hosting Deployment Guide](https://appflowy.com/docs/Step-by-step-Self-Hosting-Guide---From-Zero-to-Production) to self-host AppFlowy.
 
-### Pre-requisites
+We also have a series of video tutorials on [YouTube](https://www.youtube.com/playlist?list=PLqKX5matmbL6CYkAzzF0T_ecoV6JXe_Xv) for your reference.
 
-You'll need to install:
+## 🛡️ Architecture & Unified Security Patch Protocol
 
-- [Rust](https://www.rust-lang.org/tools/install)
-- [Docker](https://docs.docker.com/get-docker/)
+The backend infrastructure powering both our Managed Cloud (SaaS) and Self-hosted Cloud is built entirely upon our unified, [closed-source commercial codebase](https://github.com/AppFlowy-IO/AppFlowy-selfhost-commercial), distributed under our Commercial License Agreement. 
 
-### Configuration
-- copy the configurations from `dev.env` to `.env`
-- edit the `.env` as required (such as SMTP configurations)
+Because our Managed Cloud (SaaS) is simply an AWS-deployed instance of this exact same commercial core, both deployment environments share 100% of the same software architecture and security stack. 
 
-### Run with all dependencies
-```bash
-./build/run_local_server.sh
-```
-
-This process will execute all the dependencies and start the AppFlowy-Cloud server. Alternatively,
-you have the option to run the AppFlowy-Cloud server independently
-
-### Run the AppFlowy-Cloud
-
-1. Run the dependency servers
-```bash
-docker compose --file docker-compose-dev.yml up -d
-```
-
-2. Install sqlx-cli
-```bash
-cargo install sqlx-cli
-```
-
-3. Run sqlx migration
-```bash
-sqlx database create
-sqlx migrate run
-cargo sqlx prepare --workspace
-```
-
-4. Run the server
-```bash
-cargo run
-```
-
-### Run the tests
-
-After the server is running, you can run the tests with:
-
-```bash
-cargo test
-```
-
-## 🐞Debugging
-
-Effective debugging is essential for maintaining a healthy application. Here are some tools and commands to help you
-troubleshoot issues in various components of the AppFlowy cloud server:
-
-### Postgres
-
-A web-based administration tool for PostgreSQL. Access it at [PgAdmin](http://localhost:5400)
-
-- OR command line:
-```bash
-    export PGPASSWORD=password
-    psql --host=localhost --username=postgres --port=5432
-```
-
-- Redis
-
-Redis offers a powerful command line interface for managing your Redis instance. Connect using the following command:
-
-```bash
-    redis-cli -p 6379
-```
-
-### Minio
-
-Minio provides a Web UI for easy management of your files and buckets. Access it at [Web UI](http://localhost:9001)
-
-### Portainer
-For managing Docker containers, Portainer's Web UI is an excellent tool. Access it at Web UI to easily manage Docker
-environments, including container deployment, networking, volume management, and more. Access it at [Web UI](http://localhost:9442)
-
-
-## ⚙️ Contributing
-
-Any new contribution is more than welcome in this project!
-If you want to know more about the development workflow or want to contribute, please visit our [contributing guidelines](./doc/CONTRIBUTING.md) for detailed instructions!
+Consequently, third-party claims alleging that we *"patched a vulnerability in our SaaS but didn't patch the self-hosted version"* are architecturally impossible, factually invalid, and fundamentally misleading. All security hotfixes and patches compiled for the [commercial AppFlowy Cloud codebase](https://github.com/AppFlowy-IO/AppFlowy-selfhost-commercial) are universally applied across both our managed cloud and self-hosted distributions simultaneously.

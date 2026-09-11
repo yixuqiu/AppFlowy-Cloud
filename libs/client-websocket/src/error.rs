@@ -1,6 +1,7 @@
 use http::{header::HeaderName, Response};
 use std::{io, result, str, string};
 use thiserror::Error;
+use tokio_tungstenite::tungstenite::http;
 
 /// These error types are copy-pasted from the tokio_tungstenite crate.
 pub type Result<T, E = Error> = result::Result<T, E>;
@@ -59,7 +60,7 @@ pub enum Error {
   #[error("URL error: {0}")]
   Url(#[from] UrlError),
   #[error("HTTP error: {}", .0.status())]
-  Http(Response<Option<Vec<u8>>>),
+  Http(Box<Response<Option<Vec<u8>>>>),
   #[error("HTTP format error: {0}")]
   HttpFormat(#[from] http::Error),
   #[error("Parsing blobs is unsupported")]

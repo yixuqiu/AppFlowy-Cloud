@@ -8,7 +8,6 @@ edition = "2021"
 [dependencies]
 tonic.workspace = true
 prost.workspace = true
-tracing.workspace = true
 
 [build-dependencies]
-tonic-build = "0.11"
+tonic-build = "0.12.3"

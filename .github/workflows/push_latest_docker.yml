@@ -10,8 +10,8 @@ name: DockerHub Build and Push
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'               # Trigger for tags like v1.2.3
-      - '[0-9]+.[0-9]+.[0-9]+'                # Trigger for tags like 1.2.3 (without 'v')
+      - 'v[0-9]+.[0-9]+.[0-9]+*' # Trigger for tags like v1.2.3
+      - '[0-9]+.[0-9]+.[0-9]+*'  # Trigger for tags like 1.2.3 or 1.2.3-alpha
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,18 +41,18 @@ jobs:
       - name: Build and Push GoTrue
         run: |
           export TAG=${GITHUB_REF#refs/*/}
-          docker buildx build --platform linux/amd64,linux/arm64 -t appflowyinc/gotrue:${TAG} -t appflowyinc/gotrue:latest -f docker/gotrue.Dockerfile --push .
+          docker buildx build --platform linux/amd64,linux/arm64 -t appflowyinc/gotrue:${TAG} -t appflowyinc/gotrue:latest -f docker/gotrue/Dockerfile --push docker/gotrue
 
   appflowy_cloud_image:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.job.os }}
     env:
       IMAGE_NAME: ${{ secrets.DOCKER_HUB_USERNAME }}/appflowy_cloud
     strategy:
       fail-fast: false
       matrix:
         job:
-          - { name: "amd64",   docker_platform: "linux/amd64" }
-          - { name: "arm64v8", docker_platform: "linux/arm64" }
+          - { os: "ubuntu-22.04", name: "amd64",   docker_platform: "linux/amd64" }
+          - { os: "ubuntu-22.04-arm", name: "arm64v8", docker_platform: "linux/arm64" }
 
     steps:
       - name: Check out the repository
@@ -95,6 +95,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           build-args: |
+            PROFILE=release
             FEATURES=
 
       - name: Logout from Docker Hub
@@ -124,14 +125,14 @@ jobs:
           echo "GIT_TAG=$T" >> $GITHUB_ENV
 
       - name: Create and push manifest for ${{ matrix.job.image_name }}:version
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@0.4.3
         with:
           inputs: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.GIT_TAG }}
           images: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.GIT_TAG }}-arm64v8
           push: true
 
       - name: Create and push manifest for ${{ matrix.job.image_name }}:latest
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@0.4.3
         with:
           inputs: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.LATEST_TAG }}
           images: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.LATEST_TAG }}-amd64,${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.LATEST_TAG }}-arm64v8
@@ -142,15 +143,15 @@ jobs:
         run: docker logout
 
   admin_frontend_image:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.job.os }}
     env:
       IMAGE_NAME: ${{ secrets.DOCKER_HUB_USERNAME }}/admin_frontend
     strategy:
       fail-fast: false
       matrix:
         job:
-          - { name: "amd64",   docker_platform: "linux/amd64" }
-          - { name: "arm64v8", docker_platform: "linux/arm64" }
+          - { os: "ubuntu-22.04", name: "amd64",   docker_platform: "linux/amd64" }
+          - { os: "ubuntu-22.04-arm", name: "arm64v8", docker_platform: "linux/arm64" }
 
     steps:
       - name: Check out the repository
@@ -193,6 +194,8 @@ jobs:
             ${{ env.IMAGE_NAME }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
+          build-args: |
+            PROFILE=release
 
       - name: Logout from Docker Hub
         if: always()
@@ -221,14 +224,14 @@ jobs:
           echo "GIT_TAG=$T" >> $GITHUB_ENV
 
       - name: Create and push manifest for ${{ matrix.job.image_name }}:version
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@0.4.3
         with:
           inputs: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.GIT_TAG }}
           images: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.GIT_TAG }}-arm64v8
           push: true
 
       - name: Create and push manifest for ${{ matrix.job.image_name }}:latest
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@0.4.3
         with:
           inputs: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.LATEST_TAG }}
           images: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.LATEST_TAG }}-amd64,${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.LATEST_TAG }}-arm64v8
@@ -237,16 +240,17 @@ jobs:
       - name: Logout from Docker Hub
         if: always()
         run: docker logout
-  appflowy_history_image:
-    runs-on: ubuntu-22.04
+
+  appflowy_worker_image:
+    runs-on: ${{ matrix.job.os }}
     env:
-      IMAGE_NAME: ${{ secrets.DOCKER_HUB_USERNAME }}/appflowy_history
+      IMAGE_NAME: ${{ secrets.DOCKER_HUB_USERNAME }}/appflowy_worker
     strategy:
       fail-fast: false
       matrix:
         job:
-          - { name: "amd64",   docker_platform: "linux/amd64" }
-          - { name: "arm64v8", docker_platform: "linux/arm64" }
+          - { os: "ubuntu-22.04", name: "amd64",   docker_platform: "linux/amd64" }
+          - { os: "ubuntu-22.04-arm", name: "arm64v8", docker_platform: "linux/arm64" }
 
     steps:
       - name: Check out the repository
@@ -282,7 +286,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           platforms: ${{ matrix.job.docker_platform }}
-          file: ./services/appflowy-history/Dockerfile
+          file: ./services/appflowy-worker/Dockerfile
           push: true
           tags: |
             ${{ env.IMAGE_NAME }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
@@ -294,14 +298,14 @@ jobs:
         if: always()
         run: docker logout
 
-  appflowy_history_manifest:
+  appflowy_worker_manifest:
     runs-on: ubuntu-22.04
-    needs: [ appflowy_history_image ]
+    needs: [ appflowy_worker_image ]
     strategy:
       fail-fast: false
       matrix:
         job:
-          - { image_name: "appflowy_history" }
+          - { image_name: "appflowy_worker" }
 
     steps:
       - name: Log in to Docker Hub
@@ -317,14 +321,14 @@ jobs:
           echo "GIT_TAG=$T" >> $GITHUB_ENV
 
       - name: Create and push manifest for ${{ matrix.job.image_name }}:version
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@0.4.3
         with:
           inputs: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.GIT_TAG }}
           images: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.GIT_TAG }}-arm64v8
           push: true
 
       - name: Create and push manifest for ${{ matrix.job.image_name }}:latest
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@0.4.3
         with:
           inputs: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.LATEST_TAG }}
           images: ${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.LATEST_TAG }}-amd64,${{ secrets.DOCKER_HUB_USERNAME }}/${{ matrix.job.image_name }}:${{ env.LATEST_TAG }}-arm64v8

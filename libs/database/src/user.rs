@@ -1,11 +1,14 @@
-use crate::pg_row::AFUserIdRow;
-use app_error::AppError;
+use database_entity::dto::{AFUserWithAvatar, AFWebUser};
 use futures_util::stream::BoxStream;
 use sqlx::postgres::PgArguments;
 use sqlx::types::JsonValue;
 use sqlx::{Arguments, Executor, PgPool, Postgres};
 use tracing::{instrument, warn};
 use uuid::Uuid;
+
+use app_error::AppError;
+
+use crate::pg_row::AFUserIdRow;
 
 /// Updates the user's details in the `af_user` table.
 ///
@@ -37,20 +40,29 @@ pub async fn update_user(
   if let Some(n) = name {
     args_num += 1;
     set_clauses.push(format!("name = ${}", args_num));
-    args.add(n);
+    args.add(n).map_err(|err| AppError::SqlxArgEncodingError {
+      desc: format!("unable to encode user name for user {}", user_uuid),
+      err,
+    })?;
   }
 
   if let Some(e) = email {
     args_num += 1;
     set_clauses.push(format!("email = ${}", args_num));
-    args.add(e);
+    args.add(e).map_err(|err| AppError::SqlxArgEncodingError {
+      desc: format!("unable to encode email for user {}", user_uuid),
+      err,
+    })?;
   }
 
   if let Some(m) = metadata {
     args_num += 1;
     // Merge existing metadata with new metadata
     set_clauses.push(format!("metadata = metadata || ${}", args_num));
-    args.add(m);
+    args.add(m).map_err(|err| AppError::SqlxArgEncodingError {
+      desc: format!("unable to encode metadata for user {}", user_uuid),
+      err,
+    })?;
   }
 
   if set_clauses.is_empty() {
@@ -65,7 +77,12 @@ pub async fn update_user(
     set_clauses.join(", "),
     args_num
   );
-  args.add(user_uuid);
+  args
+    .add(user_uuid)
+    .map_err(|err| AppError::SqlxArgEncodingError {
+      desc: format!("unable to encode user uuid {}", user_uuid),
+      err,
+    })?;
 
   sqlx::query_with(&query, args).execute(pool).await?;
   Ok(())
@@ -104,7 +121,6 @@ pub async fn create_user<'a, E: Executor<'a, Database = Postgres>>(
     WITH ins_user AS (
         INSERT INTO af_user (uid, uuid, email, name)
         VALUES ($1, $2, $3, $4)
-        ON CONFLICT(email) DO NOTHING
         RETURNING uid
     ),
     owner_role AS (
@@ -114,13 +130,6 @@ pub async fn create_user<'a, E: Executor<'a, Database = Postgres>>(
         INSERT INTO af_workspace (owner_uid)
         SELECT uid FROM ins_user
         RETURNING workspace_id, owner_uid
-    ),
-    ins_collab_member AS (
-        INSERT INTO af_collab_member (uid, oid, permission_id)
-        SELECT ins_workspace.owner_uid,
-               ins_workspace.workspace_id::TEXT,
-               (SELECT permission_id FROM af_role_permissions WHERE role_id = owner_role.id)
-        FROM ins_workspace, owner_role
     )
     SELECT workspace_id FROM ins_workspace;
     "#,
@@ -133,6 +142,23 @@ pub async fn create_user<'a, E: Executor<'a, Database = Postgres>>(
   .await?;
 
   Ok(row.workspace_id)
+}
+
+#[inline]
+#[instrument(level = "trace", skip(executor), err)]
+pub async fn select_uuid_from_uid<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  user_uid: i64,
+) -> Result<Uuid, AppError> {
+  let uuid = sqlx::query_scalar!(
+    r#"
+      SELECT uuid FROM af_user WHERE uid = $1
+    "#,
+    user_uid
+  )
+  .fetch_one(executor)
+  .await?;
+  Ok(uuid)
 }
 
 #[inline]
@@ -214,6 +240,19 @@ pub async fn select_email_from_user_uuid(
 }
 
 #[inline]
+pub async fn select_email_from_user_uid(pool: &PgPool, user_uid: i64) -> Result<String, AppError> {
+  let email = sqlx::query_scalar!(
+    r#"
+      SELECT email FROM af_user WHERE uid = $1
+    "#,
+    user_uid
+  )
+  .fetch_one(pool)
+  .await?;
+  Ok(email)
+}
+
+#[inline]
 pub async fn select_name_from_uuid(pool: &PgPool, user_uuid: &Uuid) -> Result<String, AppError> {
   let email = sqlx::query_scalar!(
     r#"
@@ -224,4 +263,65 @@ pub async fn select_name_from_uuid(pool: &PgPool, user_uuid: &Uuid) -> Result<St
   .fetch_one(pool)
   .await?;
   Ok(email)
+}
+
+pub async fn select_name_and_email_from_uuid(
+  pool: &PgPool,
+  user_uuid: &Uuid,
+) -> Result<(String, String), AppError> {
+  let row = sqlx::query!(
+    r#"
+    SELECT name, email FROM af_user WHERE uuid = $1
+    "#,
+    user_uuid
+  )
+  .fetch_one(pool)
+  .await?;
+
+  Ok((row.name, row.email))
+}
+
+pub async fn select_web_user_from_uid(
+  pool: &PgPool,
+  uid: i64,
+) -> Result<Option<AFWebUser>, AppError> {
+  let row = sqlx::query_as!(
+    AFWebUser,
+    r#"
+    SELECT
+      uuid,
+      name,
+      metadata ->> 'icon_url' AS avatar_url
+    FROM af_user
+    WHERE uid = $1
+    "#,
+    uid
+  )
+  .fetch_optional(pool)
+  .await
+  .map_err(|err| anyhow::anyhow!("Unable to get user detail for {}: {}", uid, err))?;
+
+  Ok(row)
+}
+
+pub async fn select_user_with_avatar<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  uid: i64,
+) -> Result<AFUserWithAvatar, AppError> {
+  let user = sqlx::query_as!(
+    AFUserWithAvatar,
+    r#"
+      SELECT
+        uuid,
+        email,
+        name,
+        metadata ->> 'icon_url' AS avatar_url
+      FROM af_user
+      WHERE uid = $1;
+    "#,
+    uid
+  )
+  .fetch_one(executor)
+  .await?;
+  Ok(user)
 }

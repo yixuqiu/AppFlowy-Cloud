@@ -11,7 +11,7 @@ env:
   SQLX_VERSION: 0.7.1
   SQLX_FEATURES: "rustls,postgres"
   SQLX_OFFLINE: true
-  RUST_TOOLCHAIN: "1.77"
+  RUST_TOOLCHAIN: "1.86.0"
 
 jobs:
   test:
@@ -44,7 +44,7 @@ jobs:
         run: cp dev.env .env
 
       - name: Code Gen
-        working-directory: ./build
+        working-directory: ./script
         run: ./code_gen.sh
 
       - name: Rustfmt
